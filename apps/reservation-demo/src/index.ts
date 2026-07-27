@@ -1,0 +1,298 @@
+/**
+ * Bani Reservation Demo — Hono Worker entry point.
+ *
+ * This is the ONLY file in the entire codebase that references
+ * Cloudflare-specific APIs (ExecutionContext, env bindings, ctx.waitUntil).
+ * Every other package receives what it needs through plain function arguments.
+ */
+
+import { Hono } from "hono";
+import { createDb } from "@bani/db";
+import { createGcalClient } from "@bani/gcal-tool";
+import {
+  verifyWebhookGet,
+  verifyWebhookPost,
+  parseWebhook,
+  type InboundMessage,
+} from "@bani/whatsapp-adapter";
+import { AppError, logger, setLogLevel } from "@bani/shared";
+import { handleMessage, type HandleMessageEnv } from "./handleMessage.js";
+
+// ─── env loading ────────────────────────────────────────────────────
+
+interface WorkerEnv {
+  DATABASE_URL?: string;
+  WHATSAPP_VERIFY_TOKEN?: string;
+  WHATSAPP_ACCESS_TOKEN?: string;
+  WHATSAPP_PHONE_NUMBER_ID?: string;
+  WHATSAPP_APP_SECRET?: string;
+  WHATSAPP_GRAPH_VERSION?: string;
+  AI_PROVIDER?: string;
+  AI_MODEL?: string;
+  AI_MAX_RPM?: string;
+  GOOGLE_GENERATIVE_AI_API_KEY?: string;
+  OPENAI_API_KEY?: string;
+  ANTHROPIC_API_KEY?: string;
+  GROQ_API_KEY?: string;
+  GCAL_CALENDAR_ID?: string;
+  GCAL_SA_EMAIL?: string;
+  GCAL_SA_PRIVATE_KEY?: string;
+  DEMO_ALLOWLIST?: string;
+  AGENT_HISTORY_LIMIT?: string;
+  LOG_LEVEL?: string;
+}
+
+function loadConfig(raw: WorkerEnv): HandleMessageEnv {
+  function assert(name: string, value: string | undefined): string {
+    if (!value || value.trim() === "") {
+      throw new AppError("CONFIG", `Missing required env var: ${name}`);
+    }
+    return value;
+  }
+
+  // Required secrets
+  const DATABASE_URL = assert("DATABASE_URL", raw.DATABASE_URL);
+  const WHATSAPP_VERIFY_TOKEN = assert("WHATSAPP_VERIFY_TOKEN", raw.WHATSAPP_VERIFY_TOKEN);
+  const WHATSAPP_ACCESS_TOKEN = assert("WHATSAPP_ACCESS_TOKEN", raw.WHATSAPP_ACCESS_TOKEN);
+  const WHATSAPP_PHONE_NUMBER_ID = assert("WHATSAPP_PHONE_NUMBER_ID", raw.WHATSAPP_PHONE_NUMBER_ID);
+  const WHATSAPP_APP_SECRET = assert("WHATSAPP_APP_SECRET", raw.WHATSAPP_APP_SECRET);
+  const GOOGLE_GENERATIVE_AI_API_KEY = assert("GOOGLE_GENERATIVE_AI_API_KEY", raw.GOOGLE_GENERATIVE_AI_API_KEY);
+  const GCAL_CALENDAR_ID = assert("GCAL_CALENDAR_ID", raw.GCAL_CALENDAR_ID);
+  const GCAL_SA_EMAIL = assert("GCAL_SA_EMAIL", raw.GCAL_SA_EMAIL);
+  const GCAL_SA_PRIVATE_KEY = assert("GCAL_SA_PRIVATE_KEY", raw.GCAL_SA_PRIVATE_KEY);
+
+  // Vars with defaults
+  const WHATSAPP_GRAPH_VERSION = raw.WHATSAPP_GRAPH_VERSION ?? "v25.0";
+  const AI_PROVIDER = raw.AI_PROVIDER ?? "google";
+  const AI_MODEL = raw.AI_MODEL ?? "gemini-flash-latest";
+
+  // Numeric vars
+  const AI_MAX_RPM = Number(raw.AI_MAX_RPM ?? "10");
+  if (!Number.isInteger(AI_MAX_RPM) || AI_MAX_RPM <= 0) {
+    throw new AppError("CONFIG", "AI_MAX_RPM must be a positive integer");
+  }
+  const AGENT_HISTORY_LIMIT = Number(raw.AGENT_HISTORY_LIMIT ?? "20");
+  if (!Number.isInteger(AGENT_HISTORY_LIMIT) || AGENT_HISTORY_LIMIT <= 0) {
+    throw new AppError("CONFIG", "AGENT_HISTORY_LIMIT must be a positive integer");
+  }
+
+  // Allowlist
+  const DEMO_ALLOWLIST = (raw.DEMO_ALLOWLIST ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+
+  // Log level
+  const LOG_LEVEL = raw.LOG_LEVEL ?? "info";
+  setLogLevel(LOG_LEVEL as "debug" | "info" | "warn" | "error");
+
+  // Fix GCAL_SA_PRIVATE_KEY newlines — literal \n → real newlines
+  const fixedKey = GCAL_SA_PRIVATE_KEY.replace(/\\n/g, "\n");
+
+  return {
+    DATABASE_URL,
+    WHATSAPP_PHONE_NUMBER_ID,
+    WHATSAPP_ACCESS_TOKEN,
+    WHATSAPP_GRAPH_VERSION,
+    AI_PROVIDER,
+    AI_MODEL,
+    AI_MAX_RPM,
+    GOOGLE_GENERATIVE_AI_API_KEY,
+    OPENAI_API_KEY: raw.OPENAI_API_KEY,
+    ANTHROPIC_API_KEY: raw.ANTHROPIC_API_KEY,
+    GROQ_API_KEY: raw.GROQ_API_KEY,
+    AGENT_HISTORY_LIMIT,
+    GCAL_CALENDAR_ID,
+    GCAL_SA_EMAIL,
+    GCAL_SA_PRIVATE_KEY: fixedKey,
+    DEMO_ALLOWLIST,
+    // Store these for the GET handler
+    _verifyToken: WHATSAPP_VERIFY_TOKEN,
+    _appSecret: WHATSAPP_APP_SECRET,
+  } as HandleMessageEnv & { _verifyToken: string; _appSecret: string };
+}
+
+// ─── app ─────────────────────────────────────────────────────────────
+
+const app = new Hono<{ Bindings: WorkerEnv }>();
+
+/**
+ * GET /health
+ * Returns {"ok":true,"db":true} plus a select 1 round trip.
+ */
+app.get("/health", async (c) => {
+  try {
+    const env = c.env;
+    const sql = createDb(env.DATABASE_URL ?? "");
+    await sql`select 1`;
+    await sql.end();
+    return c.json({ ok: true, db: true });
+  } catch (err) {
+    return c.json(
+      { ok: false, db: false, error: err instanceof Error ? err.message : "unknown" },
+      500,
+    );
+  }
+});
+
+/**
+ * GET /webhook/whatsapp — Meta verification handshake.
+ */
+app.get("/webhook/whatsapp", (c) => {
+  const mode = c.req.query("hub.mode");
+  const verifyToken = c.req.query("hub.verify_token");
+  const challenge = c.req.query("hub.challenge");
+
+  try {
+    const config = loadConfig(c.env as unknown as WorkerEnv);
+    const expected = (config as unknown as { _verifyToken: string })._verifyToken;
+
+    const result = verifyWebhookGet(mode ?? null, verifyToken ?? null, expected);
+    if (result !== null && challenge) {
+      return new Response(challenge, {
+        status: 200,
+        headers: { "Content-Type": "text/plain" },
+      });
+    }
+    return new Response(null, { status: 403 });
+  } catch (err) {
+    logger.error("Config error during webhook verification", {
+      msg: err instanceof Error ? err.message : String(err),
+    });
+    return new Response(null, { status: 500 });
+  }
+});
+
+/**
+ * POST /webhook/whatsapp — inbound events from Meta.
+ */
+app.post("/webhook/whatsapp", async (c) => {
+  let config: HandleMessageEnv & { _appSecret: string };
+  try {
+    config = loadConfig(c.env as unknown as WorkerEnv) as HandleMessageEnv & { _appSecret: string };
+  } catch (err) {
+    logger.error("Config error", {
+      msg: err instanceof Error ? err.message : String(err),
+    });
+    return new Response(null, { status: 500 });
+  }
+
+  // Read body once, as text
+  const rawBody = await c.req.text();
+
+  // Verify signature
+  const signatureHeader = c.req.header("X-Hub-Signature-256");
+  const valid = await verifyWebhookPost(
+    rawBody,
+    signatureHeader ?? null,
+    config._appSecret,
+  );
+  if (!valid) {
+    const digest = signatureHeader?.slice(0, 15) ?? "missing";
+    logger.warn("Signature verification failed", {
+      msg: `Expected digest starts: ${digest}`,
+    });
+    return new Response(null, { status: 403 });
+  }
+
+  // Parse
+  let body: unknown;
+  try {
+    body = JSON.parse(rawBody);
+  } catch {
+    logger.warn("Failed to parse webhook body as JSON");
+    return new Response(null, { status: 200 });
+  }
+
+  const parsed = parseWebhook(body);
+
+  // Handle status updates
+  for (const status of parsed.statuses) {
+    if (status.status === "failed") {
+      logger.warn("WhatsApp message delivery failed", {
+        msg: `wamid=${status.waMessageId} errors=${JSON.stringify(status.errors)}`,
+      });
+    }
+    // Non-failed statuses are ignored
+  }
+
+  // Handle messages
+  for (const msg of parsed.messages) {
+    try {
+      await processMessage(msg, config, c.executionCtx);
+    } catch (err) {
+      logger.error("Unhandled error processing message", {
+        msg: err instanceof Error ? err.message : String(err),
+      });
+      // Always return 200 — Meta must not retry
+    }
+  }
+
+  // Always 200 — Meta retries on non-200
+  return new Response(null, { status: 200 });
+});
+
+/**
+ * 404 for anything else.
+ */
+app.all("*", (_c) => {
+  return new Response(null, { status: 404 });
+});
+
+// ─── message processing pipeline ─────────────────────────────────────
+
+async function processMessage(
+  msg: InboundMessage,
+  config: HandleMessageEnv,
+  execCtx: { waitUntil: (p: Promise<unknown>) => void },
+): Promise<void> {
+  // DEMO_ALLOWLIST filter
+  if (
+    config.DEMO_ALLOWLIST.length > 0 &&
+    !config.DEMO_ALLOWLIST.includes(msg.from)
+  ) {
+    logger.info("Message from non-allowlisted number — dropping", {
+      msg: `from=${msg.from}`,
+    });
+    return;
+  }
+
+  // Empty / whitespace-only text filter
+  if (msg.type === "text" && msg.text !== null && msg.text.trim() === "") {
+    return;
+  }
+
+  // Create DB and Gcal clients (per-request, postgres connects lazily)
+  const sql = createDb(config.DATABASE_URL);
+  const gcal = createGcalClient({
+    calendarId: config.GCAL_CALENDAR_ID,
+    saEmail: config.GCAL_SA_EMAIL,
+    saPrivateKeyPem: config.GCAL_SA_PRIVATE_KEY,
+    openHour: 10,
+    closeHour: 20,
+    slotMinutes: 30,
+    closedWeekdays: [5],
+    leadTimeMinutes: 60,
+    horizonDays: 60,
+  });
+
+  // Defer — wraps ctx.waitUntil for the agent run
+  const defer = (p: Promise<unknown>) => execCtx.waitUntil(p);
+
+  await handleMessage(
+    {
+      waMessageId: msg.waMessageId,
+      from: msg.from,
+      timestamp: msg.timestamp,
+      type: msg.type,
+      text: msg.text,
+      profileName: msg.profileName,
+    },
+    config,
+    sql,
+    gcal,
+    defer,
+  );
+}
+
+export default app;

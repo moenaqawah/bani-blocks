@@ -1,0 +1,16 @@
+{
+  "name": "bani-blocks",
+  "private": true,
+  "scripts": {
+    "typecheck": "pnpm -r exec tsc --noEmit",
+    "_note": "always invoke as `pnpm run <script>` — `pnpm deploy` collides with pnpm's built-in deploy command",
+    "migrate": "pnpm --filter @bani/reservation-demo exec tsx scripts/migrate.ts",
+    "dev": "pnpm --filter @bani/reservation-demo exec wrangler dev",
+    "deploy": "pnpm --filter @bani/reservation-demo exec wrangler deploy",
+    "smoke": "pnpm --filter @bani/reservation-demo exec tsx scripts/smoke.ts",
+    "evals": "pnpm --filter @bani/reservation-demo exec tsx scripts/evals.ts"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260726.1"
+  }
+}
