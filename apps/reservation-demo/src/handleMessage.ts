@@ -301,7 +301,7 @@ export async function handleMessage(
 
         const tools = buildTools(toolCtx);
         const model = getModel(env);
-        const systemPrompt = buildSystemPrompt(new Date());
+        const systemPrompt = buildSystemPrompt(new Date(), locale);
 
         const userText = ctx.text ?? "";
 

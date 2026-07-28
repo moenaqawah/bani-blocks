@@ -107,12 +107,18 @@ export async function findUpcomingLiveBookingForCustomer(
   sql: Sql,
   customerId: string,
   now: Date,
+  excludeBookingId?: string,
 ): Promise<Booking | null> {
+  // excludeBookingId lets reschedule_booking check "is there ANY OTHER live
+  // booking besides the one I'm about to replace" — without it, rescheduling
+  // would always find the very booking it's replacing and incorrectly block
+  // itself (added 2026-07-28 alongside the reschedule_booking tool).
   const rows = await sql<Booking[]>`
     select * from bookings
     where customer_id = ${customerId}
       and starts_at > ${now}
       and status in ('pending', 'confirmed')
+      and (${excludeBookingId ?? null}::uuid is null or id != ${excludeBookingId ?? null}::uuid)
     order by starts_at asc
     limit 1
   `;

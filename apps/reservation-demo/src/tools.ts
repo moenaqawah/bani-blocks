@@ -21,6 +21,7 @@ import {
   localToUtc,
   slotGrid,
   generateRef,
+  logger,
 } from "@bani/shared";
 
 export interface ToolContext {
@@ -113,6 +114,44 @@ export type CreateBookingResult =
       message: string;
       alternatives?: string[];
       existingRef?: string;
+    };
+
+// ─── reschedule_booking ──────────────────────────────────────────────
+// Added 2026-07-28: a plain cancel_booking-then-create_booking sequence
+// (the original design's only reschedule path) cancels the old slot
+// BEFORE the new one is secured — if the new booking then fails for any
+// reason, the customer is left with nothing. This tool reverses that:
+// it only cancels the old booking after the new one is confirmed, so a
+// failed reschedule always leaves the customer's original appointment
+// intact.
+
+export type RescheduleBookingResult =
+  | {
+      ok: true;
+      oldRef: string;
+      newRef: string;
+      datetimeLocal: string;
+      weekday: string;
+      service: string;
+      name: string;
+    }
+  | {
+      ok: false;
+      reason:
+        | "NOT_FOUND"
+        | "ALREADY_CANCELLED"
+        | "ALREADY_PASSED"
+        | "SLOT_TAKEN"
+        | "OUTSIDE_HOURS"
+        | "CLOSED_FRIDAY"
+        | "PAST_TIME"
+        | "TOO_SOON"
+        | "BEYOND_HORIZON"
+        | "INVALID_SLOT"
+        | "ALREADY_HAS_BOOKING"
+        | "CALENDAR_ERROR";
+      message: string;
+      alternatives?: string[];
     };
 
 // ─── cancel_booking ─────────────────────────────────────────────────
@@ -639,6 +678,248 @@ export function buildTools(ctx: ToolContext): ToolSet {
           ok: true,
           ref,
           datetimeLocal,
+          weekday: parts.weekdayEn,
+          service: serviceName,
+          name,
+        };
+      },
+    }),
+
+    reschedule_booking: tool({
+      description:
+        "Move an existing appointment to a new date/time. Use this instead of cancel_booking + " +
+        "create_booking whenever the customer wants to CHANGE an appointment they already have — " +
+        "it only releases the old slot after the new one is safely booked, so they never end up " +
+        "with nothing. Only call after the customer has explicitly confirmed the new date, time, " +
+        "service, and name.",
+      inputSchema: z.object({
+        oldRef: z
+          .string()
+          .regex(/^BK-[A-Z0-9]{6}$/i)
+          .describe("The reference of the existing booking being replaced."),
+        datetime: z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}$/)
+          .describe(
+            "New appointment start in Amman local time, format YYYY-MM-DDTHH:mm. Minutes must be 00 or 30.",
+          ),
+        name: z
+          .string()
+          .min(2)
+          .max(60)
+          .describe("The customer's name as they gave it."),
+        service: z
+          .enum(["haircut", "blowdry", "color", "keratin", "manicure"])
+          .describe("The service code for the new appointment."),
+      }),
+      execute: async (input): Promise<RescheduleBookingResult> => {
+        const { oldRef, datetime, name, service } = input;
+
+        // 1. The old booking must be real, ours, and still live.
+        const oldBooking = await findBookingByRef(ctx.sql, oldRef);
+        if (!oldBooking || oldBooking.customer_id !== ctx.customerId) {
+          return {
+            ok: false,
+            reason: "NOT_FOUND",
+            message: "I couldn't find a booking with that reference.",
+          };
+        }
+        if (oldBooking.status === "cancelled") {
+          return {
+            ok: false,
+            reason: "ALREADY_CANCELLED",
+            message: "This booking was already cancelled.",
+          };
+        }
+        const oldStartsAt = new Date(oldBooking.starts_at);
+        if (oldStartsAt < ctx.now) {
+          return {
+            ok: false,
+            reason: "ALREADY_PASSED",
+            message: "This appointment has already passed. Please call the salon directly.",
+          };
+        }
+
+        // 2. Validate the new slot — identical rules to create_booking.
+        const [datePart, timePart] = datetime.split("T") as [string, string];
+        const [hourStr, minStr] = (timePart ?? "00:00").split(":") as [string, string];
+        const hour = Number(hourStr);
+        const minutes = Number(minStr);
+
+        if (minutes !== 0 && minutes !== 30) {
+          return {
+            ok: false,
+            reason: "INVALID_SLOT",
+            message: "Appointments are on the hour or half-hour only.",
+          };
+        }
+
+        const startsAt = localToUtc(datetime);
+        const weekday = localWeekday(startsAt);
+
+        if ((BUSINESS.closedWeekdays as readonly number[]).includes(weekday)) {
+          return { ok: false, reason: "CLOSED_FRIDAY", message: "We are closed on Fridays." };
+        }
+        if (
+          hour < BUSINESS.openHour ||
+          hour > BUSINESS.closeHour ||
+          (hour === BUSINESS.closeHour && minutes > 0) ||
+          (hour === BUSINESS.closeHour - 1 && minutes > 30)
+        ) {
+          return { ok: false, reason: "OUTSIDE_HOURS", message: "That time is outside working hours." };
+        }
+        if (startsAt <= ctx.now) {
+          return { ok: false, reason: "PAST_TIME", message: "That time has already passed." };
+        }
+        const leadCutoff = new Date(ctx.now.getTime() + BUSINESS.leadTimeMinutes * 60_000);
+        if (startsAt < leadCutoff) {
+          return {
+            ok: false,
+            reason: "TOO_SOON",
+            message: `Appointments must be booked at least ${BUSINESS.leadTimeMinutes} minutes in advance.`,
+          };
+        }
+        const horizonDate = new Date(ctx.now);
+        horizonDate.setUTCDate(horizonDate.getUTCDate() + BUSINESS.horizonDays);
+        if (startsAt > horizonDate) {
+          return {
+            ok: false,
+            reason: "BEYOND_HORIZON",
+            message: `We only book up to ${BUSINESS.horizonDays} days ahead.`,
+          };
+        }
+
+        // 3. Defensive: any OTHER live booking besides the one being
+        // replaced still blocks — the one-at-a-time guardrail should have
+        // already prevented this, but don't assume it.
+        const otherExisting = await findUpcomingLiveBookingForCustomer(
+          ctx.sql,
+          ctx.customerId,
+          ctx.now,
+          oldBooking.id,
+        );
+        if (otherExisting) {
+          return {
+            ok: false,
+            reason: "ALREADY_HAS_BOOKING",
+            message: `You already have another upcoming booking (ref: ${otherExisting.ref}). Cancel it first.`,
+          };
+        }
+
+        // 4. Reserve the NEW booking in Postgres. The old booking is not
+        // touched yet — if this fails, the customer keeps what they had.
+        const endsAt = new Date(startsAt.getTime() + BUSINESS.slotMinutes * 60_000);
+        const newRef = generateRef();
+        const svc = findService(service);
+        const serviceName = svc?.en ?? service;
+
+        const newBooking = await dbCreateBooking(ctx.sql, {
+          customerId: ctx.customerId,
+          conversationId: ctx.conversationId,
+          customerName: name,
+          serviceCode: service,
+          startsAt,
+          endsAt,
+          ref: newRef,
+        });
+
+        if ("conflict" in newBooking) {
+          try {
+            const dayStart = localToUtc(`${datePart}T00:00`);
+            const dayEnd = localToUtc(`${datePart}T24:00`);
+            const live = await findLiveBookingsForDay(ctx.sql, dayStart, dayEnd);
+            const slotResult = await ctx.gcal.computeSlots(
+              datePart,
+              ctx.now,
+              live.map((b) => ({ starts_at: new Date(b.starts_at), ends_at: new Date(b.ends_at) })),
+            );
+            const alts = ctx.gcal
+              .spreadSlots(slotResult.slots, 3)
+              .map((s) => utcToLocalParts(s).time);
+            return {
+              ok: false,
+              reason: "SLOT_TAKEN",
+              message: "That slot was just taken. Here are some alternatives. Your original booking is unchanged.",
+              alternatives: alts,
+            };
+          } catch {
+            return {
+              ok: false,
+              reason: "SLOT_TAKEN",
+              message: "That slot was just taken. Your original booking is unchanged.",
+            };
+          }
+        }
+
+        const newBookingRow = newBooking;
+
+        // 5. Re-check Google for the new slot. Still haven't touched the old booking.
+        try {
+          const busy = await ctx.gcal.freeBusy(startsAt, endsAt);
+          if (busy.length > 0) {
+            await failBooking(ctx.sql, newBookingRow.id);
+            return {
+              ok: false,
+              reason: "SLOT_TAKEN",
+              message: "That slot was just booked. Your original booking is unchanged.",
+            };
+          }
+        } catch {
+          await failBooking(ctx.sql, newBookingRow.id);
+          return {
+            ok: false,
+            reason: "CALENDAR_ERROR",
+            message: "Could not complete the reschedule. Your original booking is unchanged.",
+          };
+        }
+
+        // 6. Create the new Calendar event. Still haven't touched the old booking.
+        const eventId = newBookingRow.id.replace(/-/g, "").toLowerCase();
+        const parts = utcToLocalParts(startsAt);
+        try {
+          await ctx.gcal.insertEvent({
+            eventId,
+            summary: `${serviceName} — ${name}`,
+            description: `Booked via WhatsApp. Ref ${newRef}. Phone +${ctx.waPhone}.`,
+            startLocal: `${parts.date}T${parts.time}:00`,
+            endLocal: `${utcToLocalParts(endsAt).date}T${utcToLocalParts(endsAt).time}:00`,
+          });
+        } catch {
+          await failBooking(ctx.sql, newBookingRow.id);
+          return {
+            ok: false,
+            reason: "CALENDAR_ERROR",
+            message: "Could not complete the reschedule. Your original booking is unchanged.",
+          };
+        }
+
+        // 7. The new booking is real and confirmed. ONLY NOW release the old one.
+        await confirmBooking(ctx.sql, newBookingRow.id, eventId);
+
+        if (oldBooking.gcal_event_id) {
+          try {
+            await ctx.gcal.deleteEvent(oldBooking.gcal_event_id);
+          } catch {
+            // Best effort: the new booking is already confirmed and live,
+            // so the old one must still be marked cancelled below even if
+            // its Calendar event couldn't be removed — otherwise the
+            // customer would appear to hold two live bookings, which the
+            // one-at-a-time guardrail should never allow (§5.6 takes the
+            // same stance: a customer told "done" must not still occupy
+            // the old slot in our own table, even if Calendar cleanup failed).
+            logger.error("Failed to delete old Calendar event during reschedule", {
+              conversationId: ctx.conversationId,
+              bookingRef: oldRef,
+            });
+          }
+        }
+        await dbCancelBooking(ctx.sql, oldBooking.id);
+
+        return {
+          ok: true,
+          oldRef,
+          newRef,
+          datetimeLocal: parts.human,
           weekday: parts.weekdayEn,
           service: serviceName,
           name,
