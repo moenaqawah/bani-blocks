@@ -21,22 +21,27 @@ import {
   cancelBooking,
   createBooking,
   confirmBooking,
+  getOrCreateOpenConversation,
 } from "@bani/db";
 import { createGcalClient } from "@bani/gcal-tool";
 import { localToUtc, utcToLocalParts, generateRef } from "@bani/shared";
 
 // Load .env
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const projectRoot = join(__dirname, "..", "..", "..", "..");
+const projectRoot = join(__dirname, "..", "..", "..");
 config({ path: join(projectRoot, ".env") });
 
 const args = process.argv.slice(2);
 const urlIdx = args.indexOf("--url");
 const BASE_URL = urlIdx >= 0 ? args[urlIdx + 1] : undefined;
 if (!BASE_URL) {
-  console.error("Usage: pnpm run evals -- --url <worker-url>");
+  console.error("Usage: pnpm run evals -- --url <worker-url> [--only E1,E7]");
   process.exit(1);
 }
+// --only lets you re-run a subset while iterating, instead of burning the
+// full ~50-call budget on every fix (added 2026-07-28 under a 1,000/day cap).
+const onlyIdx = args.indexOf("--only");
+const ONLY = onlyIdx >= 0 ? (args[onlyIdx + 1] ?? "").split(",").map((s) => s.trim().toUpperCase()) : null;
 
 const APP_SECRET = process.env.WHATSAPP_APP_SECRET ?? "test-secret";
 const DATABASE_URL = process.env.DATABASE_URL;
@@ -57,6 +62,21 @@ function sign(payload: string): string {
 
 function isArabic(text: string): boolean {
   return /[؀-ۿ]/.test(text);
+}
+
+// The bilingual consent line (§4.5) is prepended to the first assistant
+// message of any new conversation regardless of the customer's language —
+// so it always contains Arabic. Language-of-reply checks must strip it
+// first, or an English-language case's first reply reads as "has Arabic"
+// for reasons that have nothing to do with the model's actual behavior
+// (confirmed 2026-07-28: this made E2 fail despite a fully correct
+// English conversation).
+const CONSENT_MARKER = "manage your booking.";
+function stripConsentLine(content: string): string {
+  const idx = content.indexOf(CONSENT_MARKER);
+  if (idx === -1) return content;
+  const afterIdx = content.indexOf("\n\n", idx);
+  return afterIdx === -1 ? content : content.slice(afterIdx + 2);
 }
 
 /** Count open days from today (Sat–Thu only, skip Fridays), return date string */
@@ -291,7 +311,7 @@ async function e1() {
   // Poll for final reply
   const replies = await pollReplies(phone, 5, 45);
   const allText = replies.map((r) => r.content).join(" ");
-  const hasArabic = replies.some((r) => isArabic(r.content));
+  const hasArabic = replies.some((r) => isArabic(stripConsentLine(r.content)));
   const hasRef = allText.includes("BK-");
 
   // Check tool calls
@@ -313,10 +333,26 @@ async function e1() {
     ? (createBookingCalls[0].tool_payload as { output: { ok: boolean } }).output?.ok === true
     : false;
 
+  // The customer names a specific time ("الساعة ٥ المسا" = 17:00) that
+  // isn't guaranteed to be in the 5-slot display sample — this is exactly
+  // the scenario requestedTimeAvailable exists for (added 2026-07-28,
+  // after a live run showed the model accepting an unverified 5pm request
+  // that happened to work out, rather than actually checking it). Confirm
+  // the model used the new parameter, not just that booking succeeded —
+  // a lucky guess and a verified check look identical from the outcome
+  // alone.
+  const timeVerified = checkAvailCalls.some((c) => {
+    const p = c.tool_payload as
+      | { input?: { time?: string }; output?: { requestedTimeAvailable?: boolean } }
+      | null;
+    return p?.input?.time === "17:00" && p?.output?.requestedTimeAvailable === true;
+  });
+
   return (
     hasArabic &&
     hasRef &&
     checkAvailCalls.length >= 1 &&
+    timeVerified &&
     createBookingCalls.length === 1 &&
     createOk &&
     bookingCount !== null &&
@@ -340,7 +376,7 @@ async function e2() {
   }
   const replies = await pollReplies(phone, 4, 45);
   const allText = replies.map((r) => r.content).join(" ");
-  const noArabic = replies.every((r) => !isArabic(r.content));
+  const noArabic = replies.every((r) => !isArabic(stripConsentLine(r.content)));
 
   const sql = createDb(DATABASE_URL!);
   const createCalls = await assertTool(sql, phone, "create_booking");
@@ -449,7 +485,23 @@ async function e7() {
   const startsAt = localToUtc(`${d4}T17:00`);
   const endsAt = new Date(startsAt.getTime() + 30 * 60_000);
 
-  // Create blocker customer
+  const turns = [
+    `بدي احجز يوم ${d4}`,
+    "الساعة ٥",
+    "اسمي هدى",
+    "أكد",
+  ];
+
+  // Turn 0 only: customer names the day. 17:00 is still genuinely free at
+  // this point, so the bot's offer (if it includes 17:00) reflects reality.
+  await sendTurn(phone, turns[0]!, "text", `wamid.E7-0-${Date.now()}`);
+  await sleep(4000);
+
+  // NOW take the slot — after it may have been offered, before the customer
+  // confirms. This is the actual race the case is meant to exercise; doing
+  // this before any turn (as an earlier version of this script did) would
+  // make 17:00 unavailable from the very first check_availability call,
+  // which isn't a "taken mid-conversation" race at all (fixed 2026-07-28).
   const sql = createDb(DATABASE_URL!);
   const [blocker] = await sql<{ id: string }[]>`
     insert into customers (wa_phone, locale) values (${blockerPhone}, 'ar')
@@ -457,12 +509,11 @@ async function e7() {
     returning id
   `;
   const blockerId = blocker!.id;
-
-  // Create a confirmed booking for blocker at 17:00
+  const blockerConv = await getOrCreateOpenConversation(sql, blockerId, new Date());
   const blockerRef = generateRef();
   const b = await createBooking(sql, {
     customerId: blockerId,
-    conversationId: blockerId,
+    conversationId: blockerConv.id,
     customerName: "Blocker",
     serviceCode: "haircut",
     startsAt,
@@ -474,20 +525,10 @@ async function e7() {
   }
   await sql.end();
 
-  // Now the eval customer tries to book the same slot
-  const turns = [
-    `بدي احجز يوم ${d4}`,
-    "الساعة ٥",
-    "اسمي هدى",
-    "أكد",
-  ];
-  for (let i = 0; i < turns.length; i++) {
+  // Remaining turns: name the time, give name, confirm — by now the slot
+  // is gone, so create_booking should hit the exclusion constraint.
+  for (let i = 1; i < turns.length; i++) {
     await sendTurn(phone, turns[i]!, "text", `wamid.E7-${i}-${Date.now()}`);
-    if (i === 1) {
-      // After bot offers slots but before confirming, blocker already has booking
-      // We already inserted it above, so give a moment
-      await sleep(2000);
-    }
     await sleep(3000);
   }
   const replies = await pollReplies(phone, 4, 45);
@@ -504,16 +545,28 @@ async function e7() {
     : [];
   await sql2.end();
 
+  // The model can avoid the taken slot two valid ways: call create_booking
+  // and get SLOT_TAKEN back, or re-check availability on its own after the
+  // customer names the time and see 17:00 is gone before ever attempting
+  // to book it. Both are correct — the guardrail that actually matters is
+  // the outcome (confirmed 2026-07-28, after a stricter version of this
+  // assertion failed on a run where the model caught it via the second
+  // path, which is exactly what "never state a time is free without a
+  // fresh check" — rule 1 of the system prompt — is supposed to produce).
   const slotTakenReturned = createCalls.some((c) => {
     const payload = c.tool_payload as { output: { ok: boolean; reason?: string } } | null;
     return payload?.output?.ok === false && payload?.output?.reason === "SLOT_TAKEN";
+  });
+  const neverAttemptedTakenSlot = createCalls.every((c) => {
+    const payload = c.tool_payload as { input?: { datetime?: string } } | null;
+    return payload?.input?.datetime !== `${d4}T17:00`;
   });
   const evalHasNoBookingAtSlot = evalBookings.filter((b) => b.status === "confirmed").length === 0;
 
   // Cleanup blocker
   await cleanupCustomer(blockerPhone);
 
-  return slotTakenReturned && evalHasNoBookingAtSlot;
+  return (slotTakenReturned || neverAttemptedTakenSlot) && evalHasNoBookingAtSlot;
 }
 
 // ─── E8 — Cancellation (day +5) ─────────────────────────────────────
@@ -529,13 +582,14 @@ async function e8() {
     returning id
   `;
   const custId = cust!.id;
+  const custConv = await getOrCreateOpenConversation(sql, custId, new Date());
   const startsAt = localToUtc(`${d5}T12:00`);
   const endsAt = new Date(startsAt.getTime() + 30 * 60_000);
   const ref = generateRef();
 
   const b = await createBooking(sql, {
     customerId: custId,
-    conversationId: custId,
+    conversationId: custConv.id,
     customerName: "Eval 8",
     serviceCode: "haircut",
     startsAt,
@@ -563,7 +617,7 @@ async function e8() {
   await sql2.end();
 
   const allText = replies.map((r) => r.content).join(" ");
-  const hasArabic = replies.some((r) => isArabic(r.content));
+  const hasArabic = replies.some((r) => isArabic(stripConsentLine(r.content)));
   return cancelCalls.length === 1 && booking?.status === "cancelled" && hasArabic;
 }
 
@@ -635,31 +689,84 @@ async function e10() {
   return hasMediaFallback && cancelReturnedNotFound;
 }
 
+// ─── E11 — One booking at a time (day +7, then +8) ──────────────────
+// Deliberately does NOT script a full cancel-then-rebook to completion —
+// an earlier version did, and was fragile to whatever specific time the
+// model happened to offer as an alternative (confirmed 2026-07-28, after
+// two runs failed for unrelated reasons: the model choosing a valid but
+// unscripted path). The guardrail this case exists to prove is narrower
+// and doesn't need that: after a second, different booking is requested,
+// the customer must still have exactly one live booking. Whether the
+// model gets there via a tool-level ALREADY_HAS_BOOKING rejection or by
+// recognising the conflict itself from conversation memory is irrelevant
+// to what's being tested.
+async function e11() {
+  const phone = "962790000012";
+  const d7 = openDay(7);
+  const d8 = openDay(8);
+  const turns = [
+    `بدي احجز قص شعر يوم ${d7} الساعة ١٠`,
+    "اسمي منى",
+    "اي أكد",
+    `بدي احجز مانيكير كمان يوم ${d8} الساعة ٢ باسم منى`,
+  ];
+  for (let i = 0; i < turns.length; i++) {
+    await sendTurn(phone, turns[i]!, "text", `wamid.E11-${i}-${Date.now()}`);
+    await sleep(3000);
+  }
+  const replies = await pollReplies(phone, 4, 45);
+
+  const sql = createDb(DATABASE_URL!);
+  const [cust] = await sql<{ id: string }[]>`
+    select id from customers where wa_phone = ${phone} limit 1
+  `;
+  const bookings = cust
+    ? await sql<{ service_code: string; status: string }[]>`
+        select service_code, status from bookings where customer_id = ${cust.id}
+      `
+    : [];
+  await sql.end();
+
+  const live = bookings.filter((b) => b.status === "confirmed" || b.status === "pending");
+
+  return live.length === 1 && live[0]?.service_code === "haircut";
+}
+
 // ─── Main ────────────────────────────────────────────────────────────
+
+// Pause between cases so a run doesn't lean on the rate-limit wait/BUSY
+// path at all — a BUSY reply mid-case would fail that case's assertions
+// even though the limiter is now working as intended. At AI_MAX_RPM=15,
+// 8s between cases keeps the busiest cases (4-5 turns, 3s apart) well
+// clear of the ceiling (added 2026-07-28 after a full run tripped
+// Gemini's real 429 by running all cases back-to-back with no pacing).
+const CASES: Array<[string, string, () => Promise<boolean>]> = [
+  ["E1 — Arabic happy path", "962790000001", e1],
+  ["E2 — English happy path", "962790000002", e2],
+  ["E3 — Friday refusal", "962790000003", e3],
+  ["E4 — Outside working hours", "962790000004", e4],
+  ["E5 — Book without confirming", "962790000005", e5],
+  ["E6 — Off-topic redirect", "962790000006", e6],
+  ["E7 — Slot taken mid-conversation", "962790000007", e7],
+  ["E8 — Cancellation", "962790000008", e8],
+  ["E9 — Changes mind, then books", "962790000009", e9],
+  ["E10 — Bad reference + media fallback", "962790000010", e10],
+  ["E11 — One booking at a time", "962790000012", e11],
+];
 
 async function main() {
   console.log("Bani reservation demo — eval suite\n");
 
-  // E1
-  await runCase("E1 — Arabic happy path", "962790000001", e1);
-  // E2
-  await runCase("E2 — English happy path", "962790000002", e2);
-  // E3
-  await runCase("E3 — Friday refusal", "962790000003", e3);
-  // E4
-  await runCase("E4 — Outside working hours", "962790000004", e4);
-  // E5
-  await runCase("E5 — Book without confirming", "962790000005", e5);
-  // E6
-  await runCase("E6 — Off-topic redirect", "962790000006", e6);
-  // E7
-  await runCase("E7 — Slot taken mid-conversation", "962790000007", e7);
-  // E8
-  await runCase("E8 — Cancellation", "962790000008", e8);
-  // E9
-  await runCase("E9 — Changes mind, then books", "962790000009", e9);
-  // E10
-  await runCase("E10 — Bad reference + media fallback", "962790000010", e10);
+  const cases = ONLY
+    ? CASES.filter(([name]) => ONLY.some((id) => name.toUpperCase().startsWith(id + " ")))
+    : CASES;
+  if (ONLY) console.log(`Running only: ${cases.map(([name]) => name).join(", ")}\n`);
+
+  for (let i = 0; i < cases.length; i++) {
+    const [name, phone, fn] = cases[i]!;
+    await runCase(name, phone, fn);
+    if (i < cases.length - 1) await sleep(8000);
+  }
 
   // Summary
   const passed = results.filter((r) => r.pass).length;

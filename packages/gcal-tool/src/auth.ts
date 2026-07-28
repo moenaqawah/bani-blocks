@@ -78,7 +78,13 @@ export async function getAccessToken(cfg: {
     { alg: "RS256", typ: "JWT" },
     {
       iss: cfg.saEmail,
-      scope: "https://www.googleapis.com/auth/calendar.events",
+      // calendar.events alone is insufficient for freebusy.query — it 403s
+      // with ACCESS_TOKEN_SCOPE_INSUFFICIENT (confirmed 2026-07-28).
+      // calendar.freebusy covers the freeBusy check; calendar.events still
+      // covers event insert/delete.
+      scope:
+        "https://www.googleapis.com/auth/calendar.events " +
+        "https://www.googleapis.com/auth/calendar.freebusy",
       aud: "https://oauth2.googleapis.com/token",
       iat: nowSeconds,
       exp: nowSeconds + 3600,

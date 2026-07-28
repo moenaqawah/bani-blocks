@@ -13,13 +13,13 @@ import { config } from "dotenv";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createHmac } from "node:crypto";
-import { createDb, createBooking, cancelBooking } from "@bani/db";
+import { createDb, createBooking, cancelBooking, getOrCreateOpenConversation } from "@bani/db";
 import { createGcalClient } from "@bani/gcal-tool";
 import { localToUtc, utcToLocalParts, generateRef } from "@bani/shared";
 
 // Load .env
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const projectRoot = join(__dirname, "..", "..", "..", "..");
+const projectRoot = join(__dirname, "..", "..", "..");
 config({ path: join(projectRoot, ".env") });
 
 const args = process.argv.slice(2);
@@ -279,8 +279,9 @@ async function main() {
 
   // 10. Booking create/cancel cycle
   if (DATABASE_URL && GCAL_CALENDAR_ID && GCAL_SA_EMAIL && GCAL_SA_PRIVATE_KEY) {
+    const sql = createDb(DATABASE_URL);
+    let custIdForCleanup: string | null = null;
     try {
-      const sql = createDb(DATABASE_URL);
       const gcal = createGcalClient({
         calendarId: GCAL_CALENDAR_ID,
         saEmail: GCAL_SA_EMAIL,
@@ -311,6 +312,9 @@ async function main() {
       `;
       if (!customer) throw new Error("Failed to create smoke customer");
       const custId = customer.id;
+      custIdForCleanup = custId;
+
+      const conv = await getOrCreateOpenConversation(sql, custId, new Date());
 
       const startsAt = localToUtc(`${nextParts.date}T19:30`);
       const endsAt = new Date(startsAt.getTime() + 30 * 60_000);
@@ -319,7 +323,7 @@ async function main() {
       // Create booking
       const booking = await createBooking(sql, {
         customerId: custId,
-        conversationId: custId, // placeholder — we don't have a real conversation
+        conversationId: conv.id,
         customerName: "Smoke Test",
         serviceCode: "haircut",
         startsAt,
@@ -345,16 +349,24 @@ async function main() {
       await gcal.deleteEvent(eventId);
       await cancelBooking(sql, booking.id);
 
-      // Delete smoke customer (3-statement procedure from §2.3)
-      await sql`delete from bookings where customer_id = ${custId}`;
-      await sql`delete from conversations where customer_id = ${custId}`;
-      await sql`delete from customers where id = ${custId}`;
-
       check("10. Booking create/cancel cycle succeeded", true, ref);
-      await sql.end();
     } catch (err) {
       check("10. Booking create/cancel cycle succeeded", false,
         err instanceof Error ? err.message : String(err));
+    } finally {
+      // Teardown runs even on failure — a booking created mid-check must
+      // not survive to block the next run's slot (confirmed 2026-07-28:
+      // a failed run left a stale 'pending' row that broke the next one).
+      if (custIdForCleanup) {
+        try {
+          await sql`delete from bookings where customer_id = ${custIdForCleanup}`;
+          await sql`delete from conversations where customer_id = ${custIdForCleanup}`;
+          await sql`delete from customers where id = ${custIdForCleanup}`;
+        } catch {
+          // best effort
+        }
+      }
+      await sql.end();
     }
   } else {
     console.log("  ? 10. Skipped — no DATABASE_URL or GCAL credentials");

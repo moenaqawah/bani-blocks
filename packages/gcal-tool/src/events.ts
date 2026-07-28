@@ -22,10 +22,14 @@ export async function insertEvent(
   async function request(): Promise<{ created: boolean }> {
     const token = await getAccessToken(cfg);
 
-    const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cfg.calendarId)}/events/${encodeURIComponent(e.eventId)}`;
+    // POST to the collection endpoint with `id` in the body — this is
+    // Google's events.insert (idempotent create-with-custom-id). PUT to
+    // /events/{eventId} is events.update, which 404s because the event
+    // doesn't exist yet (confirmed 2026-07-28).
+    const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cfg.calendarId)}/events`;
 
     const response = await f(url, {
-      method: "PUT",
+      method: "POST",
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",

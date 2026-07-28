@@ -1,5 +1,5 @@
 import { type BusyInterval, freeBusy } from "./freebusy.js";
-import { slotGrid, localToUtc } from "@bani/shared";
+import { slotGrid, localToUtc, localWeekday } from "@bani/shared";
 
 export interface LiveBookingLike {
   starts_at: Date;
@@ -90,4 +90,69 @@ export function spreadSlots(slots: Date[], max: number): Date[] {
     indices.push(Math.round((i * (slots.length - 1)) / (max - 1)));
   }
   return indices.map((idx) => slots[idx]!);
+}
+
+export interface DaySlotResult {
+  date: string;
+  closed: boolean; // true on a closedWeekdays day (e.g. Friday) — 0 slots by policy, not by busy-interval overlap
+  slots: Date[];
+  totalFree: number;
+}
+
+function addDaysToLocalDate(dateStr: string, days: number): string {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  const dt = new Date(Date.UTC(y!, (m ?? 1) - 1, d ?? 1, 0, 0, 0));
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, "0")}-${String(dt.getUTCDate()).padStart(2, "0")}`;
+}
+
+/**
+ * Compute free slots across a run of consecutive local days with a SINGLE
+ * freeBusy call spanning the whole range, instead of one call per day.
+ * Google's freeBusy accepts an arbitrary timeMin/timeMax; there's no
+ * documented range cap that matters here (the app's own booking horizon
+ * is 60 days). Added 2026-07-28 — the original one-day-at-a-time
+ * check_availability meant discovering "the whole week is booked" could
+ * take up to 7 separate tool-call steps, against a 6-step-per-turn cap.
+ */
+export async function computeSlotsRange(
+  cfg: SlotConfig,
+  startDate: string,
+  numDays: number,
+  now: Date,
+  liveBookings: LiveBookingLike[],
+): Promise<DaySlotResult[]> {
+  const rangeStartUtc = localToUtc(`${startDate}T00:00`);
+  const rangeEndUtc = localToUtc(`${addDaysToLocalDate(startDate, numDays)}T00:00`);
+
+  let busy: BusyInterval[] = [];
+  try {
+    busy = await freeBusy(cfg, rangeStartUtc, rangeEndUtc);
+  } catch {
+    throw new Error("CALENDAR_ERROR");
+  }
+
+  const bookingBusy: BusyInterval[] = liveBookings.map((b) => ({
+    start: b.starts_at,
+    end: b.ends_at,
+  }));
+  const allBusy = [...busy, ...bookingBusy];
+  const leadCutoff = new Date(now.getTime() + cfg.leadTimeMinutes * 60_000);
+
+  const results: DaySlotResult[] = [];
+  for (let i = 0; i < numDays; i++) {
+    const dateStr = i === 0 ? startDate : addDaysToLocalDate(startDate, i);
+    const weekday = localWeekday(localToUtc(`${dateStr}T12:00`));
+    if (cfg.closedWeekdays.includes(weekday)) {
+      results.push({ date: dateStr, closed: true, slots: [], totalFree: 0 });
+      continue;
+    }
+    const candidates = slotGrid(dateStr).filter((s) => s > leadCutoff);
+    const free = candidates.filter((slotStart) => {
+      const slotEnd = new Date(slotStart.getTime() + cfg.slotMinutes * 60_000);
+      return !allBusy.some((b) => slotStart < b.end && slotEnd > b.start);
+    });
+    results.push({ date: dateStr, closed: false, slots: free, totalFree: free.length });
+  }
+  return results;
 }

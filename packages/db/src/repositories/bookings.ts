@@ -96,6 +96,29 @@ export async function findLiveBookingForCustomerAt(
   return rows[0] ?? null;
 }
 
+/**
+ * A customer may hold at most one upcoming live booking at a time — this
+ * is what create_booking checks before allowing a new one, so one caller
+ * can't fill the calendar with multiple holds. Past bookings (starts_at
+ * <= now) never block a new one; nothing auto-expires their status, so
+ * this filter is what keeps a finished appointment from wrongly counting.
+ */
+export async function findUpcomingLiveBookingForCustomer(
+  sql: Sql,
+  customerId: string,
+  now: Date,
+): Promise<Booking | null> {
+  const rows = await sql<Booking[]>`
+    select * from bookings
+    where customer_id = ${customerId}
+      and starts_at > ${now}
+      and status in ('pending', 'confirmed')
+    order by starts_at asc
+    limit 1
+  `;
+  return rows[0] ?? null;
+}
+
 export async function cancelBooking(
   sql: Sql,
   bookingId: string,

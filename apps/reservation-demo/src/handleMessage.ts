@@ -11,6 +11,9 @@ import {
   setCustomerLocale,
   markConsent,
   withConversationLock,
+  consumeRateLimit,
+  releaseRateLimit,
+  gcRateLimit,
   type InboundRow,
 } from "@bani/db";
 import { sendText } from "@bani/whatsapp-adapter";
@@ -22,6 +25,7 @@ import {
 import {
   logger,
   hashPhone,
+  AppError,
 } from "@bani/shared";
 import { buildSystemPrompt } from "./prompt.js";
 import { buildTools, type ToolContext } from "./tools.js";
@@ -104,6 +108,43 @@ function detectLocale(text: string | null): "ar" | "en" {
  */
 export function isArabic(text: string): boolean {
   return /[؀-ۿ]/.test(text);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Enforce AI_MAX_RPM before calling the provider (§6.5). A fixed one-minute
+ * window per env.AI_PROVIDER, backed by rate_limit_windows. On rejection the
+ * reservation is released immediately so a request that couldn't use its
+ * slot doesn't inflate the window, then we wait for the next minute
+ * boundary and retry, up to 2 waits total (~2 minutes worst case) — this
+ * runs inside ctx.waitUntil, so the delay costs nothing on the HTTP
+ * response the customer already got. Returns false if still limited after
+ * both waits, meaning the caller should fall back to the BUSY message.
+ */
+async function acquireLlmSlot(
+  sql: Sql,
+  provider: string,
+  maxRpm: number,
+): Promise<boolean> {
+  const bucketKey = `llm:${provider}`;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const { allowed, windowStart } = await consumeRateLimit(sql, bucketKey, maxRpm);
+    if (allowed) {
+      if (Math.random() < 1 / 50) {
+        gcRateLimit(sql).catch(() => {});
+      }
+      return true;
+    }
+    await releaseRateLimit(sql, bucketKey, windowStart);
+    if (attempt < 2) {
+      const msUntilNextMinute = 60_000 - (Date.now() % 60_000) + 500 + Math.floor(Math.random() * 500);
+      await sleep(msUntilNextMinute);
+    }
+  }
+  return false;
 }
 
 // ─── main handler ───────────────────────────────────────────────────
@@ -217,6 +258,38 @@ export async function handleMessage(
 
         const memory = buildMemory(rows);
 
+        const gotSlot = await acquireLlmSlot(sql, env.AI_PROVIDER, env.AI_MAX_RPM);
+        if (!gotSlot) {
+          logger.warn("LLM rate limit exhausted after retries — sending BUSY", {
+            waPhoneHash: phoneHash,
+            conversationId: conv.id,
+          });
+          const busyMsg = isNewConv
+            ? CONSENT_LINE + "\n" + bilingualMsg("BUSY", locale)
+            : bilingualMsg("BUSY", locale);
+          const busyResults = await sendText({
+            to: ctx.from,
+            body: busyMsg,
+            phoneNumberId: env.WHATSAPP_PHONE_NUMBER_ID,
+            accessToken: env.WHATSAPP_ACCESS_TOKEN,
+            graphVersion: env.WHATSAPP_GRAPH_VERSION,
+          });
+          for (const r of busyResults) {
+            await insertOutbound(sql, {
+              conversationId: conv.id,
+              customerId: customer.id,
+              content: busyMsg,
+              waMessageId: r.waMessageId,
+              waError: r.error ?? undefined,
+            });
+          }
+          if (isNewConv) {
+            await markConsent(sql, customer.id).catch(() => {});
+          }
+          await touchConversation(sql, conv.id, false);
+          return;
+        }
+
         const toolCtx: ToolContext = {
           sql,
           gcal,
@@ -287,11 +360,15 @@ export async function handleMessage(
           msg: err instanceof Error ? err.message : String(err),
         });
 
-        // Send ERROR canned reply
+        // A rate-limit failure is retry-appropriate, not a bug — BUSY
+        // reads better to the customer than the generic ERROR message.
+        const cannedKey = err instanceof AppError && err.kind === "LLM_RATE" ? "BUSY" : "ERROR";
+
+        // Send canned reply
         try {
           const errorMsg = isNewConv
-            ? CONSENT_LINE + "\n" + bilingualMsg("ERROR", locale)
-            : bilingualMsg("ERROR", locale);
+            ? CONSENT_LINE + "\n" + bilingualMsg(cannedKey, locale)
+            : bilingualMsg(cannedKey, locale);
 
           const results = await sendText({
             to: ctx.from,

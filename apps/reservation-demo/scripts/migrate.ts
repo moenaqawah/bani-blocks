@@ -20,7 +20,7 @@ import { config } from "dotenv";
 
 // Load .env
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const projectRoot = join(__dirname, "..", "..", "..", "..");
+const projectRoot = join(__dirname, "..", "..", "..");
 config({ path: join(projectRoot, ".env") });
 
 const DATABASE_URL = process.env.DATABASE_URL;

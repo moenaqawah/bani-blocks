@@ -21,6 +21,7 @@ import { handleMessage, type HandleMessageEnv } from "./handleMessage.js";
 // ─── env loading ────────────────────────────────────────────────────
 
 interface WorkerEnv {
+  HYPERDRIVE?: { connectionString: string };
   DATABASE_URL?: string;
   WHATSAPP_VERIFY_TOKEN?: string;
   WHATSAPP_ACCESS_TOKEN?: string;
@@ -89,8 +90,17 @@ function loadConfig(raw: WorkerEnv): HandleMessageEnv {
   // Fix GCAL_SA_PRIVATE_KEY newlines — literal \n → real newlines
   const fixedKey = GCAL_SA_PRIVATE_KEY.replace(/\\n/g, "\n");
 
+  // Prefer the Hyperdrive binding when present — Workers cannot hold a
+  // direct Postgres connection without hitting the subrequest limit
+  // (confirmed 2026-07-28). Hyperdrive pools at Cloudflare's edge instead;
+  // its connectionString already encodes its own sslmode, so ssl must be
+  // left off (see @bani/db createDb's `{ ssl: false }` option).
+  const useHyperdrive = raw.HYPERDRIVE !== undefined;
+  const effectiveDatabaseUrl = raw.HYPERDRIVE?.connectionString ?? DATABASE_URL;
+
   return {
-    DATABASE_URL,
+    DATABASE_URL: effectiveDatabaseUrl,
+    _useHyperdrive: useHyperdrive,
     WHATSAPP_PHONE_NUMBER_ID,
     WHATSAPP_ACCESS_TOKEN,
     WHATSAPP_GRAPH_VERSION,
@@ -109,7 +119,11 @@ function loadConfig(raw: WorkerEnv): HandleMessageEnv {
     // Store these for the GET handler
     _verifyToken: WHATSAPP_VERIFY_TOKEN,
     _appSecret: WHATSAPP_APP_SECRET,
-  } as HandleMessageEnv & { _verifyToken: string; _appSecret: string };
+  } as HandleMessageEnv & {
+    _verifyToken: string;
+    _appSecret: string;
+    _useHyperdrive: boolean;
+  };
 }
 
 // ─── app ─────────────────────────────────────────────────────────────
@@ -123,7 +137,9 @@ const app = new Hono<{ Bindings: WorkerEnv }>();
 app.get("/health", async (c) => {
   try {
     const env = c.env;
-    const sql = createDb(env.DATABASE_URL ?? "");
+    const useHyperdrive = env.HYPERDRIVE !== undefined;
+    const dbUrl = env.HYPERDRIVE?.connectionString ?? env.DATABASE_URL ?? "";
+    const sql = createDb(dbUrl, useHyperdrive ? { ssl: false } : undefined);
     await sql`select 1`;
     await sql.end();
     return c.json({ ok: true, db: true });
@@ -243,7 +259,7 @@ app.all("*", (_c) => {
 
 async function processMessage(
   msg: InboundMessage,
-  config: HandleMessageEnv,
+  config: HandleMessageEnv & { _useHyperdrive?: boolean },
   execCtx: { waitUntil: (p: Promise<unknown>) => void },
 ): Promise<void> {
   // DEMO_ALLOWLIST filter
@@ -263,7 +279,10 @@ async function processMessage(
   }
 
   // Create DB and Gcal clients (per-request, postgres connects lazily)
-  const sql = createDb(config.DATABASE_URL);
+  const sql = createDb(
+    config.DATABASE_URL,
+    config._useHyperdrive ? { ssl: false } : undefined,
+  );
   const gcal = createGcalClient({
     calendarId: config.GCAL_CALENDAR_ID,
     saEmail: config.GCAL_SA_EMAIL,

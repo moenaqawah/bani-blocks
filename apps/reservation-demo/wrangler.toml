@@ -1,4 +1,4 @@
-name = "bani-reservation-demo"
+name = "bani"
 main = "src/index.ts"
 compatibility_date = "2026-07-01"
 compatibility_flags = ["nodejs_compat"]
@@ -6,11 +6,15 @@ compatibility_flags = ["nodejs_compat"]
 [vars]
 WHATSAPP_GRAPH_VERSION = "v25.0"
 AI_PROVIDER = "google"
-AI_MODEL = "gemini-flash-latest"
-AI_MAX_RPM = "10"
+AI_MODEL = "gemini-3.1-flash-lite"
+AI_MAX_RPM = "15"
 AGENT_HISTORY_LIMIT = "20"
 LOG_LEVEL = "info"
 DEMO_ALLOWLIST = ""
 
 [observability]
 enabled = true
+
+[[hyperdrive]]
+binding = "HYPERDRIVE"
+id = "e6db5b3fb93743f0b8281d2c95197214"

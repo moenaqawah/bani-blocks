@@ -8,16 +8,16 @@ export async function consumeRateLimit(
   sql: Sql,
   bucketKey: string,
   limit: number,
-): Promise<{ allowed: boolean; count: number }> {
-  const rows = await sql<{ count: number }[]>`
+): Promise<{ allowed: boolean; count: number; windowStart: Date }> {
+  const rows = await sql<{ count: number; window_start: Date }[]>`
     insert into rate_limit_windows (bucket_key, window_start, count)
     values (${bucketKey}, date_trunc('minute', now()), 1)
     on conflict (bucket_key, window_start)
     do update set count = rate_limit_windows.count + 1
-    returning count
+    returning count, window_start
   `;
-  const count = rows[0]?.count ?? 0;
-  return { allowed: count <= limit, count };
+  const row = rows[0]!;
+  return { allowed: row.count <= limit, count: row.count, windowStart: row.window_start };
 }
 
 /**

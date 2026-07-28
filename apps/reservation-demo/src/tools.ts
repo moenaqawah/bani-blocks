@@ -12,7 +12,7 @@ import {
   failBooking,
   findBookingByRef,
   findLiveBookingsForDay,
-  findLiveBookingForCustomerAt,
+  findUpcomingLiveBookingForCustomer,
   cancelBooking as dbCancelBooking,
 } from "@bani/db";
 import {
@@ -34,6 +34,31 @@ export interface ToolContext {
 
 // ─── check_availability ────────────────────────────────────────────
 
+// ─── check_available_days ──────────────────────────────────────────
+// A day-level survey (no exact times) across a range — meant to precede
+// check_availability once the customer picks a specific day. Added
+// 2026-07-28: keeps the multi-day scan lean (a handful of bytes per day,
+// no slot lists) since exact times aren't needed until a day is chosen.
+
+export interface DaySummary {
+  date: string;
+  weekday: string;
+  closed: boolean; // true on a closed weekday (e.g. Friday)
+  totalFree: number;
+}
+
+export type CheckAvailableDaysResult =
+  | { ok: true; days: DaySummary[] }
+  | {
+      ok: false;
+      date: string;
+      reason: "PAST_DATE" | "BEYOND_HORIZON" | "NO_SLOTS" | "CALENDAR_ERROR";
+      message: string;
+      nextOpenDate?: string;
+    };
+
+// ─── check_availability ─────────────────────────────────────────────
+
 export type CheckAvailabilityResult =
   | {
       ok: true;
@@ -41,6 +66,13 @@ export type CheckAvailabilityResult =
       weekday: string;
       slots: string[];
       totalFree: number;
+      // Present only when the `time` param was passed — whether that EXACT
+      // time is free, checked against the full free-slot set (not just the
+      // 5-slot `slots` sample above). Added 2026-07-28: without this, a
+      // requested time that fell outside the displayed sample had no
+      // definitive answer, and the model would sometimes guess rather than
+      // following rule 1 ("never state a time is free without checking").
+      requestedTimeAvailable?: boolean;
     }
   | {
       ok: false;
@@ -76,10 +108,11 @@ export type CreateBookingResult =
         | "TOO_SOON"
         | "BEYOND_HORIZON"
         | "INVALID_SLOT"
-        | "DUPLICATE_BOOKING"
+        | "ALREADY_HAS_BOOKING"
         | "CALENDAR_ERROR";
       message: string;
       alternatives?: string[];
+      existingRef?: string;
     };
 
 // ─── cancel_booking ─────────────────────────────────────────────────
@@ -123,10 +156,105 @@ function nextOpenDay(date: string): string {
 
 export function buildTools(ctx: ToolContext): ToolSet {
   const tools = {
+    check_available_days: tool({
+      description:
+        "Survey which days in a range have ANY free slots, without listing exact times. Use this " +
+        "when the customer asks broadly — 'what's free this week', 'any day works', 'what's your " +
+        "earliest opening' — to see which days are worth offering BEFORE calling check_availability " +
+        "for a specific one. Cheap: one call covers up to 14 days.",
+      inputSchema: z.object({
+        date: z
+          .string()
+          .regex(/^\d{4}-\d{2}-\d{2}$/)
+          .describe(
+            "The first day to check, in Amman local time, format YYYY-MM-DD. Resolve words like 'tomorrow' yourself.",
+          ),
+        days: z
+          .number()
+          .int()
+          .min(1)
+          .max(14)
+          .describe("How many consecutive days to check starting from and including `date`."),
+      }),
+      execute: async ({ date, days }): Promise<CheckAvailableDaysResult> => {
+        const todayParts = utcToLocalParts(ctx.now);
+        if (date < todayParts.date) {
+          return { ok: false, date, reason: "PAST_DATE", message: "That date is in the past." };
+        }
+        const horizonDate = new Date(ctx.now);
+        horizonDate.setUTCDate(horizonDate.getUTCDate() + BUSINESS.horizonDays);
+        if (date > utcToLocalParts(horizonDate).date) {
+          return {
+            ok: false,
+            date,
+            reason: "BEYOND_HORIZON",
+            message: `We only book up to ${BUSINESS.horizonDays} days ahead.`,
+          };
+        }
+
+        const rangeStart = localToUtc(`${date}T00:00`);
+        const rangeEndExclusive = new Date(rangeStart.getTime() + days * 24 * 60 * 60 * 1000);
+        let liveBookings;
+        try {
+          liveBookings = await findLiveBookingsForDay(ctx.sql, rangeStart, rangeEndExclusive);
+        } catch {
+          return {
+            ok: false,
+            date,
+            reason: "CALENDAR_ERROR",
+            message: "Could not check availability. Please try again shortly.",
+          };
+        }
+
+        let dayResults;
+        try {
+          dayResults = await ctx.gcal.computeSlotsRange(
+            date,
+            days,
+            ctx.now,
+            liveBookings.map((b) => ({
+              starts_at: new Date(b.starts_at),
+              ends_at: new Date(b.ends_at),
+            })),
+          );
+        } catch {
+          return {
+            ok: false,
+            date,
+            reason: "CALENDAR_ERROR",
+            message: "Could not check availability. Please try again shortly.",
+          };
+        }
+
+        const daySummaries: DaySummary[] = dayResults.map((d) => ({
+          date: d.date,
+          weekday: utcToLocalParts(localToUtc(`${d.date}T10:00`)).weekdayEn,
+          closed: d.closed,
+          totalFree: d.totalFree,
+        }));
+
+        const anyFree = daySummaries.some((d) => d.totalFree > 0);
+        if (!anyFree) {
+          const next = nextOpenDay(daySummaries[daySummaries.length - 1]?.date ?? date);
+          return {
+            ok: false,
+            date,
+            reason: "NO_SLOTS",
+            message: `No slots available in the next ${days} days.`,
+            nextOpenDate: next,
+          };
+        }
+
+        return { ok: true, days: daySummaries };
+      },
+    }),
+
     check_availability: tool({
       description:
         "Get the real free 30-minute appointment slots for ONE day. Call this before offering or " +
-        "confirming any time. Never assume availability.",
+        "confirming any time. Never assume availability. If the customer has named a SPECIFIC time, " +
+        "pass `time` too — the response's requestedTimeAvailable tells you definitively whether that " +
+        "exact time is free, even if it isn't one of the (at most 5) times shown in `slots`.",
       inputSchema: z.object({
         date: z
           .string()
@@ -134,8 +262,16 @@ export function buildTools(ctx: ToolContext): ToolSet {
           .describe(
             "The day to check, in Amman local time, format YYYY-MM-DD. Resolve words like 'tomorrow' yourself.",
           ),
+        time: z
+          .string()
+          .regex(/^\d{2}:\d{2}$/)
+          .optional()
+          .describe(
+            "A specific time the customer named, format HH:mm on the :00/:30 grid. Only set this " +
+              "when confirming one exact time — omit it for a general 'what's available' check.",
+          ),
       }),
-      execute: async ({ date }): Promise<CheckAvailabilityResult> => {
+      execute: async ({ date, time }): Promise<CheckAvailabilityResult> => {
         // Validate weekday first
         const wd = localToUtc(`${date}T10:00`);
         const weekday = localWeekday(wd);
@@ -260,9 +396,18 @@ export function buildTools(ctx: ToolContext): ToolSet {
           localToUtc(`${date}T10:00`),
         ).weekdayEn;
 
+        let requestedTimeAvailable: boolean | undefined;
+        if (time) {
+          const requestedStart = localToUtc(`${date}T${time}`);
+          requestedTimeAvailable = freeSlots.some(
+            (s) => s.getTime() === requestedStart.getTime(),
+          );
+        }
+
         return {
           ok: true,
           date,
+          ...(requestedTimeAvailable !== undefined ? { requestedTimeAvailable } : {}),
           weekday: weekdayName,
           slots: slotStrings,
           totalFree: freeSlots.length,
@@ -365,17 +510,24 @@ export function buildTools(ctx: ToolContext): ToolSet {
           };
         }
 
-        // 2. Duplicate check
-        const existing = await findLiveBookingForCustomerAt(
+        // 2. One live booking per customer at a time — covers both an
+        // exact-slot retry and a genuinely different second booking, so a
+        // customer can't hold multiple slots (or let the model double-book
+        // them via a retried tool call). Cancel-then-rebook is the only
+        // path to change an existing booking (see Rescheduling in the
+        // system prompt).
+        const existing = await findUpcomingLiveBookingForCustomer(
           ctx.sql,
           ctx.customerId,
-          startsAt,
+          ctx.now,
         );
         if (existing) {
+          const existingParts = utcToLocalParts(new Date(existing.starts_at));
           return {
             ok: false,
-            reason: "DUPLICATE_BOOKING",
-            message: `You already have a booking at this time (ref: ${existing.ref}).`,
+            reason: "ALREADY_HAS_BOOKING",
+            message: `You already have an upcoming booking (ref: ${existing.ref}, ${existingParts.human}). Cancel it first if you want to book a different time.`,
+            existingRef: existing.ref,
           };
         }
 

@@ -3,6 +3,24 @@ import type { RunAgentArgs, RunAgentResult, StepRecord } from "./types.js";
 import { AppError } from "@bani/shared";
 
 /**
+ * True when the failure is a 429 / quota-exhausted response from the
+ * provider, possibly wrapped in the AI SDK's RetryError after exhausting
+ * its own internal retries. Distinguishing this lets the caller send the
+ * BUSY canned message instead of the generic ERROR one — a quota problem
+ * is retry-appropriate, not a bug.
+ */
+function isRateLimitError(err: unknown): boolean {
+  const e = err as { statusCode?: number; errors?: unknown[] } | undefined;
+  if (e?.statusCode === 429) return true;
+  if (Array.isArray(e?.errors)) {
+    return e.errors.some(
+      (inner) => (inner as { statusCode?: number })?.statusCode === 429,
+    );
+  }
+  return false;
+}
+
+/**
  * Run the agent loop using Vercel AI SDK v6 `generateText`.
  *
  * - stopWhen: stepCountIs(maxSteps ?? 6)
@@ -86,6 +104,9 @@ export async function runAgent(args: RunAgentArgs): Promise<RunAgentResult> {
     text = await attempt(args.userText);
   } catch (err) {
     if (err instanceof AppError) throw err;
+    if (isRateLimitError(err)) {
+      throw new AppError("LLM_RATE", "LLM rate limited", err, true);
+    }
     throw new AppError("LLM", "Agent run failed", err, true);
   }
 
