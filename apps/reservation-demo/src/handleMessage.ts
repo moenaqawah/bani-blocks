@@ -47,6 +47,7 @@ export interface HandleMessageEnv {
   GROQ_API_KEY?: string;
   // Agent
   AGENT_HISTORY_LIMIT: number;
+  AGENT_HISTORY_MAX_AGE_HOURS: number;
   // Calendar
   GCAL_CALENDAR_ID: string;
   GCAL_SA_EMAIL: string;
@@ -248,12 +249,16 @@ export async function handleMessage(
       try {
         await touchConversation(sql, conv.id, true);
 
-        // Load history
+        // Load history — bounded by both message count and recency
+        const historyCutoff = new Date(
+          Date.now() - env.AGENT_HISTORY_MAX_AGE_HOURS * 60 * 60 * 1000,
+        );
         const rows = await loadHistory(
           sql,
           conv.id,
           env.AGENT_HISTORY_LIMIT,
           inbound.id,
+          historyCutoff,
         );
 
         const memory = buildMemory(rows);

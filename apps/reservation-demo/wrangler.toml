@@ -9,6 +9,7 @@ AI_PROVIDER = "google"
 AI_MODEL = "gemini-3.1-flash-lite"
 AI_MAX_RPM = "15"
 AGENT_HISTORY_LIMIT = "20"
+AGENT_HISTORY_MAX_AGE_HOURS = "6"
 LOG_LEVEL = "info"
 DEMO_ALLOWLIST = ""
 

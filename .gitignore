@@ -4,3 +4,4 @@ dist/
 .wrangler/
 evals/results-*.json
 *.log
+notes/

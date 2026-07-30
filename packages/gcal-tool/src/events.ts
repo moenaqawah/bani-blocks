@@ -125,3 +125,65 @@ export async function deleteEvent(
     throw err;
   }
 }
+
+export interface GetEventResult {
+  exists: boolean; // false on 404/410 — event was deleted or never existed
+  status?: string; // "confirmed" | "tentative" | "cancelled" when exists
+}
+
+/**
+ * Look up a single event by id. Used to detect a booking that was
+ * cancelled directly in Calendar (e.g. by salon staff) rather than
+ * through cancel_booking/reschedule_booking — our DB has no other way
+ * to learn about that.
+ */
+export async function getEvent(
+  cfg: {
+    calendarId: string;
+    saEmail: string;
+    saPrivateKeyPem: string;
+    fetchImpl?: typeof fetch;
+  },
+  eventId: string,
+): Promise<GetEventResult> {
+  const f = cfg.fetchImpl ?? fetch;
+
+  async function request(): Promise<GetEventResult> {
+    const token = await getAccessToken(cfg);
+
+    const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cfg.calendarId)}/events/${encodeURIComponent(eventId)}`;
+
+    const response = await f(url, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    if (response.status === 401) {
+      invalidateToken();
+      throw new Error("Token expired — retry");
+    }
+
+    // Google may fully purge a deleted event (404/410) or keep a
+    // short-lived tombstone with status "cancelled" — handle both.
+    if (response.status === 404 || response.status === 410) {
+      return { exists: false };
+    }
+
+    if (!response.ok) {
+      const body = await response.text();
+      throw new Error(`getEvent failed: ${response.status} ${body}`);
+    }
+
+    const data = (await response.json()) as { status?: string };
+    return { exists: true, ...(data.status !== undefined ? { status: data.status } : {}) };
+  }
+
+  try {
+    return await request();
+  } catch (err) {
+    if (err instanceof Error && err.message === "Token expired — retry") {
+      return await request();
+    }
+    throw err;
+  }
+}

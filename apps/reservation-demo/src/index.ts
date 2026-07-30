@@ -40,6 +40,7 @@ interface WorkerEnv {
   GCAL_SA_PRIVATE_KEY?: string;
   DEMO_ALLOWLIST?: string;
   AGENT_HISTORY_LIMIT?: string;
+  AGENT_HISTORY_MAX_AGE_HOURS?: string;
   LOG_LEVEL?: string;
 }
 
@@ -75,6 +76,10 @@ function loadConfig(raw: WorkerEnv): HandleMessageEnv {
   const AGENT_HISTORY_LIMIT = Number(raw.AGENT_HISTORY_LIMIT ?? "20");
   if (!Number.isInteger(AGENT_HISTORY_LIMIT) || AGENT_HISTORY_LIMIT <= 0) {
     throw new AppError("CONFIG", "AGENT_HISTORY_LIMIT must be a positive integer");
+  }
+  const AGENT_HISTORY_MAX_AGE_HOURS = Number(raw.AGENT_HISTORY_MAX_AGE_HOURS ?? "6");
+  if (!Number.isInteger(AGENT_HISTORY_MAX_AGE_HOURS) || AGENT_HISTORY_MAX_AGE_HOURS <= 0) {
+    throw new AppError("CONFIG", "AGENT_HISTORY_MAX_AGE_HOURS must be a positive integer");
   }
 
   // Allowlist
@@ -112,6 +117,7 @@ function loadConfig(raw: WorkerEnv): HandleMessageEnv {
     ANTHROPIC_API_KEY: raw.ANTHROPIC_API_KEY,
     GROQ_API_KEY: raw.GROQ_API_KEY,
     AGENT_HISTORY_LIMIT,
+    AGENT_HISTORY_MAX_AGE_HOURS,
     GCAL_CALENDAR_ID,
     GCAL_SA_EMAIL,
     GCAL_SA_PRIVATE_KEY: fixedKey,

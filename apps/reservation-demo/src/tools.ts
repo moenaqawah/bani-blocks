@@ -174,6 +174,34 @@ export type CancelBookingResult =
       message: string;
     };
 
+// ─── get_my_booking ─────────────────────────────────────────────────
+// Looks up the customer's own upcoming booking straight from the DB,
+// keyed off ctx.customerId — independent of conversation history, so
+// it still works after the history recency window has aged a booking
+// confirmation out of context. Added 2026-07-29.
+
+export type GetMyBookingResult =
+  | {
+      found: true;
+      ref: string;
+      datetimeLocal: string;
+      weekday: string;
+      service: string;
+      name: string;
+    }
+  | {
+      found: false;
+      // Present when a live booking existed in our DB but its Calendar
+      // event is gone or cancelled — i.e. the salon cancelled it directly
+      // in Calendar rather than through cancel_booking. We reconcile our
+      // own record to 'cancelled' right here when this happens.
+      cancelledBySalon?: {
+        ref: string;
+        datetimeLocal: string;
+        service: string;
+      };
+    };
+
 // ─── helpers ────────────────────────────────────────────────────────
 
 function findService(code: string): (typeof SERVICES)[number] | undefined {
@@ -923,6 +951,62 @@ export function buildTools(ctx: ToolContext): ToolSet {
           weekday: parts.weekdayEn,
           service: serviceName,
           name,
+        };
+      },
+    }),
+
+    get_my_booking: tool({
+      description:
+        "Look up the customer's own current upcoming appointment (ref, date, time, service, name), " +
+        "if any. Use this whenever the customer asks about their booking without giving you a " +
+        "reference code — e.g. 'when is my appointment', 'what did I book', 'remind me my ref' — " +
+        "or before cancel_booking/reschedule_booking when they don't know their ref. Takes no " +
+        "input — the customer is already identified from WhatsApp. Also detects if the salon " +
+        "cancelled the appointment directly (not through you) — check cancelledBySalon in the result.",
+      inputSchema: z.object({}),
+      execute: async (): Promise<GetMyBookingResult> => {
+        const booking = await findUpcomingLiveBookingForCustomer(
+          ctx.sql,
+          ctx.customerId,
+          ctx.now,
+        );
+        if (!booking) return { found: false };
+
+        const parts = utcToLocalParts(new Date(booking.starts_at));
+        const svc = findService(booking.service_code);
+        const serviceName = svc?.en ?? booking.service_code;
+
+        // Our DB only learns of a cancellation through cancel_booking /
+        // reschedule_booking — if staff cancelled the event directly in
+        // Calendar, this row would otherwise sit as 'confirmed' forever.
+        // Check live, and reconcile our own record if it's gone.
+        if (booking.gcal_event_id) {
+          try {
+            const calEvent = await ctx.gcal.getEvent(booking.gcal_event_id);
+            if (!calEvent.exists || calEvent.status === "cancelled") {
+              await dbCancelBooking(ctx.sql, booking.id);
+              return {
+                found: false,
+                cancelledBySalon: {
+                  ref: booking.ref,
+                  datetimeLocal: parts.human,
+                  service: serviceName,
+                },
+              };
+            }
+          } catch {
+            // Calendar check failed — fall back to trusting our own DB
+            // record rather than blocking the lookup entirely.
+          }
+        }
+
+        return {
+          found: true,
+          ref: booking.ref,
+          datetimeLocal: parts.human,
+          weekday: parts.weekdayEn,
+          service: serviceName,
+          name: booking.customer_name,
         };
       },
     }),

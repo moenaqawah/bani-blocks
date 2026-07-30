@@ -63,18 +63,26 @@ export async function insertToolRow(
 /**
  * Load conversation history for the agent, excluding the current message
  * and tool rows. Returns oldest → newest order.
+ *
+ * `sinceDate` bounds history by recency, independent of the conversation's
+ * open/closed status — a conversation can stay open indefinitely (each gap
+ * under 24h), but anything older than `sinceDate` is excluded here so the
+ * agent isn't fed hours-old, possibly-stale context (e.g. slot availability
+ * mentioned much earlier that may no longer hold).
  */
 export async function loadHistory(
   sql: Sql,
   conversationId: string,
   limit: number,
   excludeMessageId: string,
+  sinceDate: Date,
 ): Promise<Message[]> {
   const rows = await sql<Message[]>`
     select * from messages
     where conversation_id = ${conversationId}
       and role in ('user', 'assistant')
       and id <> ${excludeMessageId}
+      and created_at > ${sinceDate}
     order by created_at desc
     limit ${limit}
   `;

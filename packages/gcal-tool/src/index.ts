@@ -1,5 +1,5 @@
 import { freeBusy, type BusyInterval } from "./freebusy.js";
-import { insertEvent, deleteEvent, type InsertEventInput } from "./events.js";
+import { insertEvent, deleteEvent, getEvent, type InsertEventInput, type GetEventResult } from "./events.js";
 import {
   computeSlots,
   computeSlotsRange,
@@ -10,12 +10,13 @@ import {
   type DaySlotResult,
 } from "./slots.js";
 
-export type { BusyInterval, InsertEventInput, SlotConfig, SlotResult, LiveBookingLike, DaySlotResult };
+export type { BusyInterval, InsertEventInput, GetEventResult, SlotConfig, SlotResult, LiveBookingLike, DaySlotResult };
 
 export interface GcalClient {
   freeBusy(timeMin: Date, timeMax: Date): Promise<BusyInterval[]>;
   insertEvent(e: InsertEventInput): Promise<{ created: boolean }>;
   deleteEvent(eventId: string): Promise<void>;
+  getEvent(eventId: string): Promise<GetEventResult>;
   computeSlots(localDate: string, now: Date, liveBookings: LiveBookingLike[]): Promise<SlotResult>;
   computeSlotsRange(
     startDate: string,
@@ -54,6 +55,9 @@ export function createGcalClient(cfg: {
 
     deleteEvent: (eventId) =>
       deleteEvent(authCfg, eventId),
+
+    getEvent: (eventId) =>
+      getEvent(authCfg, eventId),
 
     computeSlots: (localDate, now, liveBookings) =>
       computeSlots(cfg, localDate, now, liveBookings),
