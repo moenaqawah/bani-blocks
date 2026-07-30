@@ -2,13 +2,6 @@ import { generateText, stepCountIs } from "ai";
 import type { RunAgentArgs, RunAgentResult, StepRecord } from "./types.js";
 import { AppError } from "@bani/shared";
 
-/**
- * True when the failure is a 429 / quota-exhausted response from the
- * provider, possibly wrapped in the AI SDK's RetryError after exhausting
- * its own internal retries. Distinguishing this lets the caller send the
- * BUSY canned message instead of the generic ERROR one — a quota problem
- * is retry-appropriate, not a bug.
- */
 function isRateLimitError(err: unknown): boolean {
   const e = err as { statusCode?: number; errors?: unknown[] } | undefined;
   if (e?.statusCode === 429) return true;
@@ -21,15 +14,26 @@ function isRateLimitError(err: unknown): boolean {
 }
 
 /**
- * Run the agent loop using Vercel AI SDK v6 `generateText`.
- *
- * - stopWhen: stepCountIs(maxSteps ?? 6)
- * - temperature: 0.3
- * - Tools execute server-side inside `execute`.
- * - Steps are recorded for persistence (debugging + evals).
- * - If final text is empty, retry once with an appended instruction.
- *   If still empty, throw — the caller sends a canned ERROR message.
+ * AI SDK v6 StepResult: each step has a `content` array whose items
+ * have a `type` field: "tool-call", "tool-result", "tool-error", "text".
+ * This is the observed shape from Google Gemini via the AI SDK.
  */
+type SDKContent = {
+  type: string;
+  toolCallId?: string;
+  toolName?: string;
+  args?: unknown;
+  input?: unknown;
+  result?: unknown;
+  output?: unknown;
+  error?: unknown;
+};
+
+type SDKStep = {
+  stepNumber?: number;
+  content?: SDKContent[];
+};
+
 export async function runAgent(args: RunAgentArgs): Promise<RunAgentResult> {
   const maxSteps = args.maxSteps ?? 6;
   const recordedSteps: StepRecord[] = [];
@@ -48,48 +52,60 @@ export async function runAgent(args: RunAgentArgs): Promise<RunAgentResult> {
       temperature: 0.3,
     });
 
-    // Extract steps for debugging/evals
-    const steps = result?.steps as Array<{
-      toolCalls?: Array<{
-        toolName: string;
-        args?: unknown;
-        input?: unknown;
-      }>;
-      toolResults?: Array<{
-        toolName: string;
-        result?: unknown;
-        output?: unknown;
-        error?: unknown;
-      }>;
-    }> | undefined;
+    const steps = result?.steps as SDKStep[] | undefined;
 
     if (steps) {
       for (const step of steps) {
-        if (step.toolCalls) {
-          for (const tc of step.toolCalls) {
-            recordedSteps.push({
-              toolName: tc.toolName,
-              input: tc.args ?? tc.input,
+        const content = step.content;
+        if (!content) continue;
+
+        for (const item of content) {
+          if (item.type === "tool-call") {
+            // New tool call — record as pending
+            const rec: StepRecord = {
+              toolName: item.toolName!,
+              input: item.args ?? item.input,
               output: "pending",
-            });
-          }
-        }
-        if (step.toolResults) {
-          for (const tr of step.toolResults) {
-            // Match back to the corresponding step entry (search in reverse)
-            let matching: StepRecord | undefined;
-            for (let i = recordedSteps.length - 1; i >= 0; i--) {
-              const s = recordedSteps[i];
-              if (s && s.toolName === tr.toolName && s.output === "pending") {
-                matching = s;
-                break;
+            };
+            if (item.toolCallId) rec.toolCallId = item.toolCallId;
+            recordedSteps.push(rec);
+          } else if (item.type === "tool-result" || item.type === "tool-error") {
+            // Resolve the pending call — match by toolCallId first, then by toolName
+            const matched = item.toolCallId
+              ? recordedSteps.find(
+                  (s) => s.output === "pending" && s.toolCallId === item.toolCallId,
+                )
+              : undefined;
+            const fallback = !matched
+              ? recordedSteps.find(
+                  (s) => s.output === "pending" && s.toolName === item.toolName,
+                )
+              : undefined;
+            const target = matched ?? fallback;
+
+            if (target) {
+              target.output = item.result ?? item.output ?? item.error ?? target.output;
+              if (item.error) {
+                target.errorMessage =
+                  typeof item.error === "string"
+                    ? item.error
+                    : JSON.stringify(item.error);
               }
-            }
-            if (matching) {
-              matching.output = tr.result ?? tr.output;
-              if (tr.error) {
-                matching.errorMessage = String(tr.error);
-              }
+            } else {
+              // Orphaned result — no matching call found
+              recordedSteps.push({
+                toolName: item.toolName!,
+                input: item.input,
+                output: item.result ?? item.output ?? item.error,
+                ...(item.error
+                  ? {
+                      errorMessage:
+                        typeof item.error === "string"
+                          ? item.error
+                          : JSON.stringify(item.error),
+                    }
+                  : {}),
+              });
             }
           }
         }
@@ -110,7 +126,7 @@ export async function runAgent(args: RunAgentArgs): Promise<RunAgentResult> {
     throw new AppError("LLM", "Agent run failed", err, true);
   }
 
-  // Empty text fallback: retry once with appended instruction
+  // Empty text fallback: retry once
   if (!text.trim()) {
     try {
       text = await attempt(

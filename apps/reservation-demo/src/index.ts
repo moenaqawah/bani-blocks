@@ -4,6 +4,10 @@
  * This is the ONLY file in the entire codebase that references
  * Cloudflare-specific APIs (ExecutionContext, env bindings, ctx.waitUntil).
  * Every other package receives what it needs through plain function arguments.
+ *
+ * Multi-calendar: GCAL_CALENDARS (JSON map keyed by resource code) is the
+ * new secret for multi-resource deployments. Falls back to GCAL_CALENDAR_ID
+ * for single-calendar clients.
  */
 
 import { Hono } from "hono";
@@ -17,6 +21,7 @@ import {
 } from "@bani/whatsapp-adapter";
 import { AppError, logger, setLogLevel } from "@bani/shared";
 import { handleMessage, type HandleMessageEnv } from "./handleMessage.js";
+import { RESOURCES, RESOURCE_CODES, SERVICES } from "./config.js";
 
 // ─── env loading ────────────────────────────────────────────────────
 
@@ -35,6 +40,7 @@ interface WorkerEnv {
   ANTHROPIC_API_KEY?: string;
   GROQ_API_KEY?: string;
   GCAL_CALENDAR_ID?: string;
+  GCAL_CALENDARS?: string;    // JSON: {"muna":"...","rana":"..."}
   GCAL_SA_EMAIL?: string;
   GCAL_SA_PRIVATE_KEY?: string;
   DEMO_ALLOWLIST?: string;
@@ -58,9 +64,36 @@ function loadConfig(raw: WorkerEnv): HandleMessageEnv {
   const WHATSAPP_PHONE_NUMBER_ID = assert("WHATSAPP_PHONE_NUMBER_ID", raw.WHATSAPP_PHONE_NUMBER_ID);
   const WHATSAPP_APP_SECRET = assert("WHATSAPP_APP_SECRET", raw.WHATSAPP_APP_SECRET);
   const GOOGLE_GENERATIVE_AI_API_KEY = assert("GOOGLE_GENERATIVE_AI_API_KEY", raw.GOOGLE_GENERATIVE_AI_API_KEY);
-  const GCAL_CALENDAR_ID = assert("GCAL_CALENDAR_ID", raw.GCAL_CALENDAR_ID);
   const GCAL_SA_EMAIL = assert("GCAL_SA_EMAIL", raw.GCAL_SA_EMAIL);
   const GCAL_SA_PRIVATE_KEY = assert("GCAL_SA_PRIVATE_KEY", raw.GCAL_SA_PRIVATE_KEY);
+
+  // Calendar config: prefer GCAL_CALENDARS (multi-resource), fall back to
+  // GCAL_CALENDAR_ID (single-resource).
+  const GCAL_CALENDAR_ID = raw.GCAL_CALENDAR_ID;
+  const GCAL_CALENDARS = raw.GCAL_CALENDARS;
+
+  // Parse calendar map
+  let calendars: Record<string, string>;
+  if (GCAL_CALENDARS) {
+    try {
+      calendars = JSON.parse(GCAL_CALENDARS) as Record<string, string>;
+    } catch (err) {
+      throw new AppError("CONFIG", "GCAL_CALENDARS is not valid JSON");
+    }
+  } else if (GCAL_CALENDAR_ID) {
+    // Fallback: map the first active resource to the single calendar
+    const first = RESOURCES.find((r) => r.active);
+    if (first) {
+      calendars = { [first.code]: GCAL_CALENDAR_ID };
+    } else {
+      throw new AppError("CONFIG", "No active resources configured");
+    }
+  } else {
+    throw new AppError("CONFIG", "Either GCAL_CALENDARS or GCAL_CALENDAR_ID is required");
+  }
+
+  // Boot-time validation (fail fast)
+  validateCalendarConfig(calendars);
 
   // Vars with defaults
   const WHATSAPP_GRAPH_VERSION = raw.WHATSAPP_GRAPH_VERSION ?? "v25.0";
@@ -87,14 +120,10 @@ function loadConfig(raw: WorkerEnv): HandleMessageEnv {
   const LOG_LEVEL = raw.LOG_LEVEL ?? "info";
   setLogLevel(LOG_LEVEL as "debug" | "info" | "warn" | "error");
 
-  // Fix GCAL_SA_PRIVATE_KEY newlines — literal \n → real newlines
+  // Fix GCAL_SA_PRIVATE_KEY newlines
   const fixedKey = GCAL_SA_PRIVATE_KEY.replace(/\\n/g, "\n");
 
-  // Prefer the Hyperdrive binding when present — Workers cannot hold a
-  // direct Postgres connection without hitting the subrequest limit
-  // (confirmed 2026-07-28). Hyperdrive pools at Cloudflare's edge instead;
-  // its connectionString already encodes its own sslmode, so ssl must be
-  // left off (see @bani/db createDb's `{ ssl: false }` option).
+  // Hyperdrive
   const useHyperdrive = raw.HYPERDRIVE !== undefined;
   const effectiveDatabaseUrl = raw.HYPERDRIVE?.connectionString ?? DATABASE_URL;
 
@@ -112,10 +141,12 @@ function loadConfig(raw: WorkerEnv): HandleMessageEnv {
     GROQ_API_KEY: raw.GROQ_API_KEY,
     AGENT_HISTORY_LIMIT,
     AGENT_HISTORY_MAX_AGE_HOURS,
-    GCAL_CALENDAR_ID,
+    GCAL_CALENDAR_ID: GCAL_CALENDAR_ID ?? "",
+    GCAL_CALENDARS,
     GCAL_SA_EMAIL,
     GCAL_SA_PRIVATE_KEY: fixedKey,
     DEMO_ALLOWLIST,
+    _calendars: calendars,
     // Store these for the GET handler
     _verifyToken: WHATSAPP_VERIFY_TOKEN,
     _appSecret: WHATSAPP_APP_SECRET,
@@ -123,17 +154,83 @@ function loadConfig(raw: WorkerEnv): HandleMessageEnv {
     _verifyToken: string;
     _appSecret: string;
     _useHyperdrive: boolean;
+    _calendars: Record<string, string>;
   };
+}
+
+/**
+ * Boot-time validation of the calendar configuration.
+ * Fails fast with AppError("CONFIG", …) on misconfiguration.
+ */
+function validateCalendarConfig(calendars: Record<string, string>): void {
+  const activeResources = RESOURCES.filter((r) => r.active);
+  const resourceCodes: Set<string> = new Set(activeResources.map((r) => r.code as string));
+
+  // 1. Every active resource has a calendar id
+  for (const r of activeResources) {
+    if (!calendars[r.code]) {
+      throw new AppError(
+        "CONFIG",
+        `Resource "${r.code}" (${r.en}) has no calendar id in GCAL_CALENDARS`,
+      );
+    }
+  }
+
+  // 2. Every key in calendars matches a known resource code
+  for (const key of Object.keys(calendars)) {
+    if (!resourceCodes.has(key)) {
+      throw new AppError(
+        "CONFIG",
+        `GCAL_CALENDARS key "${key}" does not match any active resource code. Known codes: ${Array.from(resourceCodes).join(", ")}`,
+      );
+    }
+  }
+
+  // 3. No calendar id appears twice
+  const seenCalendarIds = new Map<string, string>();
+  for (const [rc, calId] of Object.entries(calendars)) {
+    const existing = seenCalendarIds.get(calId);
+    if (existing) {
+      throw new AppError(
+        "CONFIG",
+        `Calendar id "${calId}" is shared by resources "${existing}" and "${rc}". Each resource must have its own calendar.`,
+      );
+    }
+    seenCalendarIds.set(calId, rc);
+  }
+
+  // 4. Every service in any resource's services exists in SERVICES
+  const serviceCodeSet: Set<string> = new Set(SERVICES.map((s) => s.code as string));
+  for (const r of activeResources) {
+    if (typeof r.services === "string") continue;
+    for (const sc of r.services as readonly string[]) {
+      if (!serviceCodeSet.has(sc)) {
+        throw new AppError(
+          "CONFIG",
+          `Resource "${r.code}" references unknown service "${sc}"`,
+        );
+      }
+    }
+  }
+
+  // 5. Every service in SERVICES is covered by ≥1 active resource
+  for (const s of SERVICES) {
+    const covered = activeResources.some(
+      (r) => typeof r.services === "string" || (r.services as readonly string[]).includes(s.code),
+    );
+    if (!covered) {
+      throw new AppError(
+        "CONFIG",
+        `Service "${s.code}" (${s.en}) is not covered by any active resource — it would never have slots`,
+      );
+    }
+  }
 }
 
 // ─── app ─────────────────────────────────────────────────────────────
 
 const app = new Hono<{ Bindings: WorkerEnv }>();
 
-/**
- * GET /health
- * Returns {"ok":true,"db":true} plus a select 1 round trip.
- */
 app.get("/health", async (c) => {
   try {
     const env = c.env;
@@ -151,9 +248,6 @@ app.get("/health", async (c) => {
   }
 });
 
-/**
- * GET /webhook/whatsapp — Meta verification handshake.
- */
 app.get("/webhook/whatsapp", (c) => {
   const mode = c.req.query("hub.mode");
   const verifyToken = c.req.query("hub.verify_token");
@@ -179,13 +273,13 @@ app.get("/webhook/whatsapp", (c) => {
   }
 });
 
-/**
- * POST /webhook/whatsapp — inbound events from Meta.
- */
 app.post("/webhook/whatsapp", async (c) => {
-  let config: HandleMessageEnv & { _appSecret: string };
+  let config: HandleMessageEnv & { _appSecret: string; _calendars: Record<string, string> };
   try {
-    config = loadConfig(c.env as unknown as WorkerEnv) as HandleMessageEnv & { _appSecret: string };
+    config = loadConfig(c.env as unknown as WorkerEnv) as HandleMessageEnv & {
+      _appSecret: string;
+      _calendars: Record<string, string>;
+    };
   } catch (err) {
     logger.error("Config error", {
       msg: err instanceof Error ? err.message : String(err),
@@ -231,7 +325,6 @@ app.post("/webhook/whatsapp", async (c) => {
         msg: `wamid=${status.waMessageId} errors=${JSON.stringify(status.errors)}`,
       });
     }
-    // Non-failed statuses are ignored
   }
 
   // Handle messages
@@ -246,13 +339,9 @@ app.post("/webhook/whatsapp", async (c) => {
     }
   }
 
-  // Always 200 — Meta retries on non-200
   return new Response(null, { status: 200 });
 });
 
-/**
- * 404 for anything else.
- */
 app.all("*", (_c) => {
   return new Response(null, { status: 404 });
 });
@@ -261,7 +350,7 @@ app.all("*", (_c) => {
 
 async function processMessage(
   msg: InboundMessage,
-  config: HandleMessageEnv & { _useHyperdrive?: boolean },
+  config: HandleMessageEnv & { _useHyperdrive?: boolean; _calendars: Record<string, string> },
   execCtx: { waitUntil: (p: Promise<unknown>) => void },
 ): Promise<void> {
   // DEMO_ALLOWLIST filter
@@ -280,13 +369,13 @@ async function processMessage(
     return;
   }
 
-  // Create DB and Gcal clients (per-request, postgres connects lazily)
+  // Create DB and multi-calendar Gcal clients
   const sql = createDb(
     config.DATABASE_URL,
     config._useHyperdrive ? { ssl: false } : undefined,
   );
   const gcal = createGcalClient({
-    calendarId: config.GCAL_CALENDAR_ID,
+    calendars: config._calendars,
     saEmail: config.GCAL_SA_EMAIL,
     saPrivateKeyPem: config.GCAL_SA_PRIVATE_KEY,
     openHour: 10,

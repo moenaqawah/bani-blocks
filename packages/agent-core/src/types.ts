@@ -27,6 +27,7 @@ export interface StepRecord {
   toolName: string;
   input: unknown;
   output: unknown;
+  toolCallId?: string;
   errorMessage?: string;
 }
 

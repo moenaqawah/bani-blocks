@@ -218,21 +218,27 @@ async function cleanupCustomer(phone: string) {
   if (!cust) { await sql.end(); return; }
 
   // Cancel live bookings through tool layer (clean up Google)
-  const bookings = await sql<{ id: string; gcal_event_id: string | null; status: string }[]>`
-    select id, gcal_event_id, status from bookings where customer_id = ${cust.id}
+  const bookings = await sql<{ id: string; gcal_event_id: string | null; status: string; resource_code: string }[]>`
+    select id, gcal_event_id, status, resource_code from bookings where customer_id = ${cust.id}
   `;
   for (const b of bookings) {
     if (b.gcal_event_id && (b.status === "confirmed" || b.status === "pending")) {
       if (GCAL_CALENDAR_ID && GCAL_SA_EMAIL && GCAL_SA_PRIVATE_KEY) {
         try {
+          // Build a calendars map from the env — we only have GCAL_CALENDAR_ID,
+          // so map all known resources to it (scripts use a single calendar)
+          const calendars: Record<string, string> = {
+            muna: GCAL_CALENDAR_ID, rana: GCAL_CALENDAR_ID,
+            layan: GCAL_CALENDAR_ID, hiba: GCAL_CALENDAR_ID,
+          };
           const gcal = createGcalClient({
-            calendarId: GCAL_CALENDAR_ID,
+            calendars,
             saEmail: GCAL_SA_EMAIL,
             saPrivateKeyPem: GCAL_SA_PRIVATE_KEY,
             openHour: 10, closeHour: 20, slotMinutes: 30,
             closedWeekdays: [5], leadTimeMinutes: 60, horizonDays: 60,
           });
-          await gcal.deleteEvent(b.gcal_event_id);
+          await gcal.deleteEvent(b.resource_code || "muna", b.gcal_event_id);
         } catch { /* best effort */ }
       }
     }
@@ -317,7 +323,7 @@ async function e1() {
   // Check tool calls
   const sql = createDb(DATABASE_URL!);
   const checkAvailCalls = await assertTool(sql, phone, "check_availability");
-  const createBookingCalls = await assertTool(sql, phone, "create_booking");
+  const createBookingCalls = await assertTool(sql, phone, "create_bookings");
   const [cust] = await sql<{ id: string }[]>`
     select id from customers where wa_phone = ${phone} limit 1
   `;
@@ -329,8 +335,8 @@ async function e1() {
     : null;
   await sql.end();
 
-  const createOk = createBookingCalls.length === 1 && createBookingCalls[0]?.tool_payload
-    ? (createBookingCalls[0].tool_payload as { output: { ok: boolean } }).output?.ok === true
+  const createOk = createBookingCalls.length >= 1 && createBookingCalls[0]?.tool_payload
+    ? (createBookingCalls[0].tool_payload as { output: { results?: Array<{ ok: boolean }> } }).output?.results?.[0]?.ok === true
     : false;
 
   // The customer names a specific time ("الساعة ٥ المسا" = 17:00) that
@@ -379,7 +385,7 @@ async function e2() {
   const noArabic = replies.every((r) => !isArabic(stripConsentLine(r.content)));
 
   const sql = createDb(DATABASE_URL!);
-  const createCalls = await assertTool(sql, phone, "create_booking");
+  const createCalls = await assertTool(sql, phone, "create_bookings");
   const [cust] = await sql<{ id: string }[]>`
     select id from customers where wa_phone = ${phone} limit 1
   `;
@@ -405,7 +411,7 @@ async function e3() {
   const replies = await pollReplies(phone, 1, 30);
 
   const sql = createDb(DATABASE_URL!);
-  const createCalls = await assertTool(sql, phone, "create_booking");
+  const createCalls = await assertTool(sql, phone, "create_bookings");
   await sql.end();
 
   const allText = replies.map((r) => r.content).join(" ");
@@ -422,7 +428,7 @@ async function e4() {
   const replies = await pollReplies(phone, 1, 30);
 
   const sql = createDb(DATABASE_URL!);
-  const createCalls = await assertTool(sql, phone, "create_booking");
+  const createCalls = await assertTool(sql, phone, "create_bookings");
   const [cust] = await sql<{ id: string }[]>`
     select id from customers where wa_phone = ${phone} limit 1
   `;
@@ -448,7 +454,7 @@ async function e5() {
   const replies = await pollReplies(phone, 2, 45);
 
   const sql = createDb(DATABASE_URL!);
-  const createCalls = await assertTool(sql, phone, "create_booking");
+  const createCalls = await assertTool(sql, phone, "create_bookings");
   await sql.end();
 
   return createCalls.length === 0;
@@ -469,7 +475,7 @@ async function e6() {
 
   const sql = createDb(DATABASE_URL!);
   const checkCalls = await assertTool(sql, phone, "check_availability");
-  const createCalls = await assertTool(sql, phone, "create_booking");
+  const createCalls = await assertTool(sql, phone, "create_bookings");
   await sql.end();
 
   return noAdvice && checkCalls.length >= 1 && createCalls.length === 0;
@@ -497,11 +503,9 @@ async function e7() {
   await sendTurn(phone, turns[0]!, "text", `wamid.E7-0-${Date.now()}`);
   await sleep(4000);
 
-  // NOW take the slot — after it may have been offered, before the customer
-  // confirms. This is the actual race the case is meant to exercise; doing
-  // this before any turn (as an earlier version of this script did) would
-  // make 17:00 unavailable from the very first check_availability call,
-  // which isn't a "taken mid-conversation" race at all (fixed 2026-07-28).
+  // NOW take the slot on ALL FOUR employees — after it may have been
+  // offered, before the customer confirms. With multi-calendar, blocking
+  // only one employee would just make the bot fall through to another.
   const sql = createDb(DATABASE_URL!);
   const [blocker] = await sql<{ id: string }[]>`
     insert into customers (wa_phone, locale) values (${blockerPhone}, 'ar')
@@ -510,18 +514,26 @@ async function e7() {
   `;
   const blockerId = blocker!.id;
   const blockerConv = await getOrCreateOpenConversation(sql, blockerId, new Date());
-  const blockerRef = generateRef();
-  const b = await createBooking(sql, {
-    customerId: blockerId,
-    conversationId: blockerConv.id,
-    customerName: "Blocker",
-    serviceCode: "haircut",
-    startsAt,
-    endsAt,
-    ref: blockerRef,
-  });
-  if (!("conflict" in b)) {
-    await confirmBooking(sql, b.id, "blocker-event-id");
+  const allResources = ["muna", "rana", "layan", "hiba"] as const;
+  for (const rc of allResources) {
+    const blockerRef = generateRef();
+    const blockerBundleId = crypto.randomUUID();
+    const blockerGroupId = crypto.randomUUID();
+    const b = await createBooking(sql, {
+      customerId: blockerId,
+      conversationId: blockerConv.id,
+      customerName: "Blocker",
+      serviceCode: "haircut",
+      resourceCode: rc,
+      bookingGroupId: blockerGroupId,
+      bundleId: blockerBundleId,
+      startsAt,
+      endsAt,
+      ref: blockerRef,
+    });
+    if (!("conflict" in b)) {
+      await confirmBooking(sql, b.id, "blocker-event-id");
+    }
   }
   await sql.end();
 
@@ -534,7 +546,7 @@ async function e7() {
   const replies = await pollReplies(phone, 4, 45);
 
   const sql2 = createDb(DATABASE_URL!);
-  const createCalls = await assertTool(sql2, phone, "create_booking");
+  const createCalls = await assertTool(sql2, phone, "create_bookings");
   const [cust] = await sql2<{ id: string }[]>`
     select id from customers where wa_phone = ${phone} limit 1
   `;
@@ -554,12 +566,12 @@ async function e7() {
   // path, which is exactly what "never state a time is free without a
   // fresh check" — rule 1 of the system prompt — is supposed to produce).
   const slotTakenReturned = createCalls.some((c) => {
-    const payload = c.tool_payload as { output: { ok: boolean; reason?: string } } | null;
-    return payload?.output?.ok === false && payload?.output?.reason === "SLOT_TAKEN";
+    const payload = c.tool_payload as { output: { results?: Array<{ ok: boolean; reason?: string }> } } | null;
+    return payload?.output?.results?.some((r) => r.ok === false && r.reason === "SLOT_TAKEN") ?? false;
   });
   const neverAttemptedTakenSlot = createCalls.every((c) => {
-    const payload = c.tool_payload as { input?: { datetime?: string } } | null;
-    return payload?.input?.datetime !== `${d4}T17:00`;
+    const payload = c.tool_payload as { input?: { bundles?: Array<{ datetime?: string }> } } | null;
+    return payload?.input?.bundles?.every((b) => b.datetime !== `${d4}T17:00`) ?? false;
   });
   const evalHasNoBookingAtSlot = evalBookings.filter((b) => b.status === "confirmed").length === 0;
 
@@ -587,11 +599,16 @@ async function e8() {
   const endsAt = new Date(startsAt.getTime() + 30 * 60_000);
   const ref = generateRef();
 
+  const eval8BundleId = crypto.randomUUID();
+  const eval8GroupId = crypto.randomUUID();
   const b = await createBooking(sql, {
     customerId: custId,
     conversationId: custConv.id,
     customerName: "Eval 8",
     serviceCode: "haircut",
+    resourceCode: "muna",
+    bookingGroupId: eval8GroupId,
+    bundleId: eval8BundleId,
     startsAt,
     endsAt,
     ref,
@@ -640,7 +657,7 @@ async function e9() {
 
   const sql = createDb(DATABASE_URL!);
   const checkCalls = await assertTool(sql, phone, "check_availability");
-  const createCalls = await assertTool(sql, phone, "create_booking");
+  const createCalls = await assertTool(sql, phone, "create_bookings");
   const [cust] = await sql<{ id: string }[]>`
     select id from customers where wa_phone = ${phone} limit 1
   `;
@@ -689,17 +706,11 @@ async function e10() {
   return hasMediaFallback && cancelReturnedNotFound;
 }
 
-// ─── E11 — One booking at a time (day +7, then +8) ──────────────────
-// Deliberately does NOT script a full cancel-then-rebook to completion —
-// an earlier version did, and was fragile to whatever specific time the
-// model happened to offer as an alternative (confirmed 2026-07-28, after
-// two runs failed for unrelated reasons: the model choosing a valid but
-// unscripted path). The guardrail this case exists to prove is narrower
-// and doesn't need that: after a second, different booking is requested,
-// the customer must still have exactly one live booking. Whether the
-// model gets there via a tool-level ALREADY_HAS_BOOKING rejection or by
-// recognising the conflict itself from conversation memory is irrelevant
-// to what's being tested.
+// ─── E11 — Multi-booking allowed (day +7, then +8) ──────────────────
+// The old "one booking at a time" guardrail is DELETED — a customer may
+// now hold multiple non-overlapping bookings. This test validates that
+// two appointments on different days both succeed (not blocked by any
+// leftover ALREADY_HAS_BOOKING logic).
 async function e11() {
   const phone = "962790000012";
   const d7 = openDay(7);
@@ -708,13 +719,15 @@ async function e11() {
     `بدي احجز قص شعر يوم ${d7} الساعة ١٠`,
     "اسمي منى",
     "اي أكد",
-    `بدي احجز مانيكير كمان يوم ${d8} الساعة ٢ باسم منى`,
+    `بدي احجز مانيكير كمان يوم ${d8} الساعة ٢`,
+    "اسمي منى",
+    "اي أكد",
   ];
   for (let i = 0; i < turns.length; i++) {
     await sendTurn(phone, turns[i]!, "text", `wamid.E11-${i}-${Date.now()}`);
     await sleep(3000);
   }
-  const replies = await pollReplies(phone, 4, 45);
+  const replies = await pollReplies(phone, 6, 60);
 
   const sql = createDb(DATABASE_URL!);
   const [cust] = await sql<{ id: string }[]>`
@@ -728,8 +741,11 @@ async function e11() {
   await sql.end();
 
   const live = bookings.filter((b) => b.status === "confirmed" || b.status === "pending");
+  const hasHaircut = live.some((b) => b.service_code === "haircut");
+  const hasManicure = live.some((b) => b.service_code === "manicure");
 
-  return live.length === 1 && live[0]?.service_code === "haircut";
+  // Both bookings should succeed — the old one-at-a-time gate is gone
+  return live.length === 2 && hasHaircut && hasManicure;
 }
 
 // ─── Main ────────────────────────────────────────────────────────────
@@ -751,7 +767,7 @@ const CASES: Array<[string, string, () => Promise<boolean>]> = [
   ["E8 — Cancellation", "962790000008", e8],
   ["E9 — Changes mind, then books", "962790000009", e9],
   ["E10 — Bad reference + media fallback", "962790000010", e10],
-  ["E11 — One booking at a time", "962790000012", e11],
+  ["E11 — Multi-booking allowed", "962790000012", e11],
 ];
 
 async function main() {

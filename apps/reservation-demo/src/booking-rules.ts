@@ -1,14 +1,12 @@
 /**
  * Booking slot validation — pure, policy-parameterised rules.
  *
- * Extracted from the duplicated validation blocks that existed verbatim in
- * create_booking.execute and reschedule_booking.execute. Returns a
- * discriminated union carrying the parsed Date and datePart on success so
- * callers never re-parse after validation.
+ * Extended for multi-resource: validation now accepts an optional
+ * `durationMinutes` so the last-bookable-start check is service-dependent.
  */
 
 import { localToUtc, localWeekday } from "@bani/shared";
-import { BUSINESS } from "./config.js";
+import { BUSINESS, RESOURCES } from "./config.js";
 
 // ─── reason codes — single source of truth ──────────────────────────
 
@@ -21,11 +19,14 @@ export type SlotValidationReason =
   | "TOO_SOON"
   | "BEYOND_HORIZON";
 
-/** Reasons create_booking can return beyond validation failures. */
+/** Reasons create_bookings can return beyond validation failures. */
 export type CreateBookingReason =
   | SlotValidationReason
   | "SLOT_TAKEN"
-  | "ALREADY_HAS_BOOKING"
+  | "RESOURCE_CANNOT_DO_SERVICE"
+  | "CUSTOMER_BUSY"
+  | "TOO_MANY_UPCOMING"
+  | "DUPLICATE_SERVICE_SAME_DAY"
   | "CALENDAR_ERROR";
 
 /** Reasons reschedule_booking can return beyond validation failures. */
@@ -38,7 +39,6 @@ export type RescheduleBookingReason =
 /** Reasons cancel_booking can return. */
 export type CancelBookingReason =
   | "NOT_FOUND"
-  | "NOT_YOURS"
   | "ALREADY_CANCELLED"
   | "ALREADY_PASSED"
   | "CALENDAR_ERROR";
@@ -49,6 +49,7 @@ export type AvailabilityReason =
   | "PAST_DATE"
   | "BEYOND_HORIZON"
   | "NO_SLOTS"
+  | "RESOURCE_CANNOT_DO_SERVICE"
   | "CALENDAR_ERROR";
 
 // ─── policy ──────────────────────────────────────────────────────────
@@ -81,16 +82,15 @@ export type ValidateSlotResult =
 /**
  * Validate a slot datetime string against business policy.
  *
- * The `datetime` parameter is an Amman-local ISO string in the format
- * `YYYY-MM-DDTHH:mm` (no seconds, no offset). Minutes must be `00` or `30`.
- *
- * Returns a discriminated union — the caller branches on `ok` and gets
- * the parsed `startsAt` and `datePart` for free on success, so it never
- * needs to re-parse or re-derive them.
+ * `datetime` is an Amman-local ISO string `YYYY-MM-DDTHH:mm`.
+ * `durationMinutes` is optional — when provided, the OUTSIDE_HOURS check
+ * ensures the end time is also within business hours (a 180-min keratin
+ * can't start at 19:00 because it would end at 22:00).
  */
 export function validateSlot(
   datetime: string,
   policy: SlotPolicy,
+  durationMinutes?: number,
 ): ValidateSlotResult {
   const split = datetime.split("T");
   const datePart = split[0]!;
@@ -122,17 +122,31 @@ export function validateSlot(
     };
   }
 
-  // 3. Working hours — [openHour, closeHour), last start at (closeHour - 1):30
+  // 3. Working hours
+  // Calculate end hour:minutes from start + duration
+  const dur = durationMinutes ?? 30;
+  const endTotalMinutes = hour * 60 + minutes + dur;
+  const endHour = Math.floor(endTotalMinutes / 60);
+  const endMin = endTotalMinutes % 60;
+
+  // Start must be within [openHour, closeHour)
+  if (hour < policy.openHour) {
+    return {
+      ok: false,
+      reason: "OUTSIDE_HOURS",
+      message: "That time is before opening hours.",
+    };
+  }
+
+  // End must be ≤ closeHour (exclusive at closeHour:00, or exactly at closeHour:00)
   if (
-    hour < policy.openHour ||
-    hour > policy.closeHour ||
-    (hour === policy.closeHour && minutes > 0) ||
-    (hour === policy.closeHour - 1 && minutes > 30)
+    endHour > policy.closeHour ||
+    (endHour === policy.closeHour && endMin > 0)
   ) {
     return {
       ok: false,
       reason: "OUTSIDE_HOURS",
-      message: "That time is outside working hours.",
+      message: `This service takes ${dur} minutes and would finish after closing time (${policy.closeHour}:00).`,
     };
   }
 
@@ -179,6 +193,7 @@ export function validateSlot(
 export function validateSlotWithBusiness(
   datetime: string,
   now: Date,
+  durationMinutes?: number,
 ): ValidateSlotResult {
   return validateSlot(datetime, {
     openHour: BUSINESS.openHour,
@@ -187,5 +202,49 @@ export function validateSlotWithBusiness(
     leadTimeMinutes: BUSINESS.leadTimeMinutes,
     horizonDays: BUSINESS.horizonDays,
     now,
-  });
+  }, durationMinutes);
+}
+
+// ─── capability check ────────────────────────────────────────────────
+
+export type CapabilityResult =
+  | { ok: true }
+  | { ok: false; unbookableServices: string[]; capableInstead: string[] };
+
+/**
+ * Check if a resource can perform every service in the list.
+ * Returns the unbookable services and which resources CAN do them on failure.
+ */
+export function checkResourceCapability(
+  resourceCode: string,
+  serviceCodes: string[],
+): CapabilityResult {
+  const r = RESOURCES.find((x) => x.code === resourceCode);
+  if (!r || !r.active) {
+    return {
+      ok: false,
+      unbookableServices: serviceCodes,
+      capableInstead: findCapableAlternatives(serviceCodes),
+    };
+  }
+  if (typeof r.services === "string") return { ok: true };
+
+  const allowed = r.services;
+  const unbookable = serviceCodes.filter((sc) => !allowed.includes(sc));
+  if (unbookable.length === 0) return { ok: true };
+
+  return {
+    ok: false,
+    unbookableServices: unbookable,
+    capableInstead: findCapableAlternatives(unbookable),
+  };
+}
+
+function findCapableAlternatives(serviceCodes: string[]): string[] {
+  return RESOURCES
+    .filter((r) => r.active && (
+      typeof r.services === "string" ||
+      serviceCodes.every((sc) => (r.services as readonly string[]).includes(sc))
+    ))
+    .map((r) => r.code);
 }

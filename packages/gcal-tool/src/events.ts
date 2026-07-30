@@ -1,20 +1,24 @@
 import { getAccessToken, invalidateToken } from "./auth.js";
 
 export interface InsertEventInput {
-  eventId: string; // our booking uuid, dashes stripped, lowercased
+  eventId: string; // our bundle uuid, dashes stripped, lowercased
   summary: string;
   description: string;
   startLocal: string; // "2026-07-28T17:00:00"
   endLocal: string; // "2026-07-28T17:30:00"
 }
 
+/**
+ * Insert an event on a specific calendar.
+ * `calendarId` is now a required parameter — no longer read from global config.
+ */
 export async function insertEvent(
   cfg: {
-    calendarId: string;
     saEmail: string;
     saPrivateKeyPem: string;
     fetchImpl?: typeof fetch;
   },
+  calendarId: string,
   e: InsertEventInput,
 ): Promise<{ created: boolean }> {
   const f = cfg.fetchImpl ?? fetch;
@@ -22,11 +26,7 @@ export async function insertEvent(
   async function request(): Promise<{ created: boolean }> {
     const token = await getAccessToken(cfg);
 
-    // POST to the collection endpoint with `id` in the body — this is
-    // Google's events.insert (idempotent create-with-custom-id). PUT to
-    // /events/{eventId} is events.update, which 404s because the event
-    // doesn't exist yet (confirmed 2026-07-28).
-    const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cfg.calendarId)}/events`;
+    const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events`;
 
     const response = await f(url, {
       method: "POST",
@@ -78,13 +78,16 @@ export async function insertEvent(
   }
 }
 
+/**
+ * Delete an event from a specific calendar.
+ */
 export async function deleteEvent(
   cfg: {
-    calendarId: string;
     saEmail: string;
     saPrivateKeyPem: string;
     fetchImpl?: typeof fetch;
   },
+  calendarId: string,
   eventId: string,
 ): Promise<void> {
   const f = cfg.fetchImpl ?? fetch;
@@ -92,7 +95,7 @@ export async function deleteEvent(
   async function request(): Promise<void> {
     const token = await getAccessToken(cfg);
 
-    const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cfg.calendarId)}/events/${encodeURIComponent(eventId)}`;
+    const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`;
 
     const response = await f(url, {
       method: "DELETE",
@@ -132,18 +135,17 @@ export interface GetEventResult {
 }
 
 /**
- * Look up a single event by id. Used to detect a booking that was
- * cancelled directly in Calendar (e.g. by salon staff) rather than
- * through cancel_booking/reschedule_booking — our DB has no other way
- * to learn about that.
+ * Look up a single event by id on a specific calendar.
+ * Used to detect a booking that was cancelled directly in Calendar
+ * (e.g. by salon staff).
  */
 export async function getEvent(
   cfg: {
-    calendarId: string;
     saEmail: string;
     saPrivateKeyPem: string;
     fetchImpl?: typeof fetch;
   },
+  calendarId: string,
   eventId: string,
 ): Promise<GetEventResult> {
   const f = cfg.fetchImpl ?? fetch;
@@ -151,7 +153,7 @@ export async function getEvent(
   async function request(): Promise<GetEventResult> {
     const token = await getAccessToken(cfg);
 
-    const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(cfg.calendarId)}/events/${encodeURIComponent(eventId)}`;
+    const url = `https://www.googleapis.com/calendar/v3/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`;
 
     const response = await f(url, {
       method: "GET",

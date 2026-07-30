@@ -46,9 +46,12 @@ export interface Booking {
   conversation_id: string | null;
   customer_name: string;
   service_code: string;
+  resource_code: string;
+  booking_group_id: string;
+  bundle_id: string;
   starts_at: Date;
   ends_at: Date;
-  status: "pending" | "confirmed" | "cancelled" | "failed";
+  status: "confirmed" | "cancelled" | "failed";
   gcal_event_id: string | null;
   cancelled_at: Date | null;
   created_at: Date;
@@ -91,6 +94,9 @@ export interface NewBooking {
   conversationId: string;
   customerName: string;
   serviceCode: string;
+  resourceCode: string;
+  bookingGroupId: string;
+  bundleId: string;
   startsAt: Date;
   endsAt: Date;
   ref: string;

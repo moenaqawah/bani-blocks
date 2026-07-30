@@ -232,8 +232,9 @@ async function main() {
   // 8. Google Calendar connectivity
   if (GCAL_CALENDAR_ID && GCAL_SA_EMAIL && GCAL_SA_PRIVATE_KEY) {
     try {
+      const calendars = { muna: GCAL_CALENDAR_ID };
       const gcal = createGcalClient({
-        calendarId: GCAL_CALENDAR_ID,
+        calendars,
         saEmail: GCAL_SA_EMAIL,
         saPrivateKeyPem: GCAL_SA_PRIVATE_KEY,
         openHour: 10,
@@ -250,7 +251,7 @@ async function main() {
       const dayStart = localToUtc(`${tomorrowParts.date}T00:00`);
       const dayEnd = localToUtc(`${tomorrowParts.date}T24:00`);
 
-      const busy = await gcal.freeBusy(dayStart, dayEnd);
+      const busy = await gcal.freeBusy(GCAL_CALENDAR_ID, dayStart, dayEnd);
       check("8. Google Calendar freeBusy query succeeded",
         true,
         `${busy.length} busy intervals`);
@@ -282,8 +283,9 @@ async function main() {
     const sql = createDb(DATABASE_URL);
     let custIdForCleanup: string | null = null;
     try {
+      const calendars = { muna: GCAL_CALENDAR_ID };
       const gcal = createGcalClient({
-        calendarId: GCAL_CALENDAR_ID,
+        calendars,
         saEmail: GCAL_SA_EMAIL,
         saPrivateKeyPem: GCAL_SA_PRIVATE_KEY,
         openHour: 10,
@@ -295,8 +297,8 @@ async function main() {
       });
 
       // Find next open day (skip Friday)
-      const now = new Date();
-      let nextDay = new Date(now);
+      const nowFor10 = new Date();
+      let nextDay = new Date(nowFor10);
       nextDay.setUTCDate(nextDay.getUTCDate() + 1);
       while (nextDay.getUTCDay() === 5) {
         nextDay.setUTCDate(nextDay.getUTCDate() + 1);
@@ -319,6 +321,8 @@ async function main() {
       const startsAt = localToUtc(`${nextParts.date}T19:30`);
       const endsAt = new Date(startsAt.getTime() + 30 * 60_000);
       const ref = generateRef();
+      const bundleId = crypto.randomUUID();
+      const groupId = crypto.randomUUID();
 
       // Create booking
       const booking = await createBooking(sql, {
@@ -326,6 +330,9 @@ async function main() {
         conversationId: conv.id,
         customerName: "Smoke Test",
         serviceCode: "haircut",
+        resourceCode: "muna",
+        bookingGroupId: groupId,
+        bundleId,
         startsAt,
         endsAt,
         ref,
@@ -336,8 +343,8 @@ async function main() {
       }
 
       // Confirm
-      const eventId = booking.id.replace(/-/g, "").toLowerCase();
-      await gcal.insertEvent({
+      const eventId = bundleId.replace(/-/g, "").toLowerCase();
+      await gcal.insertEvent("muna", {
         eventId,
         summary: "Haircut — Smoke Test",
         description: `Booked via smoke test. Ref ${ref}.`,
@@ -346,7 +353,7 @@ async function main() {
       });
 
       // Cancel
-      await gcal.deleteEvent(eventId);
+      await gcal.deleteEvent("muna", eventId);
       await cancelBooking(sql, booking.id);
 
       check("10. Booking create/cancel cycle succeeded", true, ref);
