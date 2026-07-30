@@ -1,5 +1,5 @@
 import { type BusyInterval, freeBusy } from "./freebusy.js";
-import { slotGrid, localToUtc, localWeekday } from "@bani/shared";
+import { slotGrid, localToUtc, localWeekday, AppError } from "@bani/shared";
 
 export interface LiveBookingLike {
   starts_at: Date;
@@ -56,8 +56,8 @@ export async function computeSlots(
   let busy: BusyInterval[] = [];
   try {
     busy = await freeBusy(cfg, dayStart, dayEnd);
-  } catch {
-    throw new Error("CALENDAR_ERROR");
+  } catch (err) {
+    throw new AppError("CALENDAR", "FreeBusy query failed", err);
   }
 
   // Also consider live bookings as busy
@@ -128,8 +128,8 @@ export async function computeSlotsRange(
   let busy: BusyInterval[] = [];
   try {
     busy = await freeBusy(cfg, rangeStartUtc, rangeEndUtc);
-  } catch {
-    throw new Error("CALENDAR_ERROR");
+  } catch (err) {
+    throw new AppError("CALENDAR", "FreeBusy query failed", err);
   }
 
   const bookingBusy: BusyInterval[] = liveBookings.map((b) => ({

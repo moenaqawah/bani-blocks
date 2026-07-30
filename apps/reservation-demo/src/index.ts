@@ -30,7 +30,6 @@ interface WorkerEnv {
   WHATSAPP_GRAPH_VERSION?: string;
   AI_PROVIDER?: string;
   AI_MODEL?: string;
-  AI_MAX_RPM?: string;
   GOOGLE_GENERATIVE_AI_API_KEY?: string;
   OPENAI_API_KEY?: string;
   ANTHROPIC_API_KEY?: string;
@@ -69,10 +68,6 @@ function loadConfig(raw: WorkerEnv): HandleMessageEnv {
   const AI_MODEL = raw.AI_MODEL ?? "gemini-flash-latest";
 
   // Numeric vars
-  const AI_MAX_RPM = Number(raw.AI_MAX_RPM ?? "10");
-  if (!Number.isInteger(AI_MAX_RPM) || AI_MAX_RPM <= 0) {
-    throw new AppError("CONFIG", "AI_MAX_RPM must be a positive integer");
-  }
   const AGENT_HISTORY_LIMIT = Number(raw.AGENT_HISTORY_LIMIT ?? "20");
   if (!Number.isInteger(AGENT_HISTORY_LIMIT) || AGENT_HISTORY_LIMIT <= 0) {
     throw new AppError("CONFIG", "AGENT_HISTORY_LIMIT must be a positive integer");
@@ -111,7 +106,6 @@ function loadConfig(raw: WorkerEnv): HandleMessageEnv {
     WHATSAPP_GRAPH_VERSION,
     AI_PROVIDER,
     AI_MODEL,
-    AI_MAX_RPM,
     GOOGLE_GENERATIVE_AI_API_KEY,
     OPENAI_API_KEY: raw.OPENAI_API_KEY,
     ANTHROPIC_API_KEY: raw.ANTHROPIC_API_KEY,
@@ -221,8 +215,10 @@ app.post("/webhook/whatsapp", async (c) => {
   let body: unknown;
   try {
     body = JSON.parse(rawBody);
-  } catch {
-    logger.warn("Failed to parse webhook body as JSON");
+  } catch (err) {
+    logger.warn("Failed to parse webhook body as JSON", {
+      msg: err instanceof Error ? err.message : String(err),
+    });
     return new Response(null, { status: 200 });
   }
 

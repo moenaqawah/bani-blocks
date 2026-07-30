@@ -7,6 +7,13 @@ import {
   SERVICES,
 } from "./config.js";
 import {
+  validateSlotWithBusiness,
+  type CreateBookingReason,
+  type RescheduleBookingReason,
+  type CancelBookingReason,
+  type AvailabilityReason,
+} from "./booking-rules.js";
+import {
   createBooking as dbCreateBooking,
   confirmBooking,
   failBooking,
@@ -53,7 +60,7 @@ export type CheckAvailableDaysResult =
   | {
       ok: false;
       date: string;
-      reason: "PAST_DATE" | "BEYOND_HORIZON" | "NO_SLOTS" | "CALENDAR_ERROR";
+      reason: AvailabilityReason;
       message: string;
       nextOpenDate?: string;
     };
@@ -78,12 +85,7 @@ export type CheckAvailabilityResult =
   | {
       ok: false;
       date: string;
-      reason:
-        | "CLOSED_FRIDAY"
-        | "PAST_DATE"
-        | "BEYOND_HORIZON"
-        | "NO_SLOTS"
-        | "CALENDAR_ERROR";
+      reason: AvailabilityReason;
       message: string;
       nextOpenDate?: string;
     };
@@ -101,16 +103,7 @@ export type CreateBookingResult =
     }
   | {
       ok: false;
-      reason:
-        | "SLOT_TAKEN"
-        | "OUTSIDE_HOURS"
-        | "CLOSED_FRIDAY"
-        | "PAST_TIME"
-        | "TOO_SOON"
-        | "BEYOND_HORIZON"
-        | "INVALID_SLOT"
-        | "ALREADY_HAS_BOOKING"
-        | "CALENDAR_ERROR";
+      reason: CreateBookingReason;
       message: string;
       alternatives?: string[];
       existingRef?: string;
@@ -137,19 +130,7 @@ export type RescheduleBookingResult =
     }
   | {
       ok: false;
-      reason:
-        | "NOT_FOUND"
-        | "ALREADY_CANCELLED"
-        | "ALREADY_PASSED"
-        | "SLOT_TAKEN"
-        | "OUTSIDE_HOURS"
-        | "CLOSED_FRIDAY"
-        | "PAST_TIME"
-        | "TOO_SOON"
-        | "BEYOND_HORIZON"
-        | "INVALID_SLOT"
-        | "ALREADY_HAS_BOOKING"
-        | "CALENDAR_ERROR";
+      reason: RescheduleBookingReason;
       message: string;
       alternatives?: string[];
     };
@@ -165,12 +146,7 @@ export type CancelBookingResult =
     }
   | {
       ok: false;
-      reason:
-        | "NOT_FOUND"
-        | "NOT_YOURS"
-        | "ALREADY_CANCELLED"
-        | "ALREADY_PASSED"
-        | "CALENDAR_ERROR";
+      reason: CancelBookingReason;
       message: string;
     };
 
@@ -264,7 +240,10 @@ export function buildTools(ctx: ToolContext): ToolSet {
         let liveBookings;
         try {
           liveBookings = await findLiveBookingsForDay(ctx.sql, rangeStart, rangeEndExclusive);
-        } catch {
+        } catch (err) {
+          logger.error("findLiveBookingsForDay failed in check_available_days", {
+            msg: err instanceof Error ? err.message : String(err),
+          });
           return {
             ok: false,
             date,
@@ -284,7 +263,10 @@ export function buildTools(ctx: ToolContext): ToolSet {
               ends_at: new Date(b.ends_at),
             })),
           );
-        } catch {
+        } catch (err) {
+          logger.error("computeSlotsRange failed in check_available_days", {
+            msg: err instanceof Error ? err.message : String(err),
+          });
           return {
             ok: false,
             date,
@@ -406,7 +388,11 @@ export function buildTools(ctx: ToolContext): ToolSet {
             dayStart,
             dayEnd,
           );
-        } catch {
+        } catch (err) {
+          logger.error("findLiveBookingsForDay failed in check_availability", {
+            date,
+            msg: err instanceof Error ? err.message : String(err),
+          });
           return {
             ok: false,
             date,
@@ -426,7 +412,11 @@ export function buildTools(ctx: ToolContext): ToolSet {
               ends_at: new Date(b.ends_at),
             })),
           );
-        } catch {
+        } catch (err) {
+          logger.error("computeSlots failed in check_availability", {
+            date,
+            msg: err instanceof Error ? err.message : String(err),
+          });
           return {
             ok: false,
             date,
@@ -505,77 +495,12 @@ export function buildTools(ctx: ToolContext): ToolSet {
       execute: async (input): Promise<CreateBookingResult> => {
         const { datetime, name, service } = input;
 
-        // 1. Validate
-        const [datePart, timePart] = datetime.split("T") as [string, string];
-        const [hourStr, minStr] = (timePart ?? "00:00").split(":") as [
-          string,
-          string,
-        ];
-        const hour = Number(hourStr);
-        const minutes = Number(minStr);
-
-        if (minutes !== 0 && minutes !== 30) {
-          return {
-            ok: false,
-            reason: "INVALID_SLOT",
-            message: "Appointments are on the hour or half-hour only.",
-          };
+        // 1. Validate slot against business policy
+        const validation = validateSlotWithBusiness(datetime, ctx.now);
+        if (!validation.ok) {
+          return { ok: false, reason: validation.reason, message: validation.message };
         }
-
-        const startsAt = localToUtc(datetime);
-        const weekday = localWeekday(startsAt);
-
-        if ((BUSINESS.closedWeekdays as readonly number[]).includes(weekday)) {
-          return {
-            ok: false,
-            reason: "CLOSED_FRIDAY",
-            message: "We are closed on Fridays.",
-          };
-        }
-
-        if (
-          hour < BUSINESS.openHour ||
-          hour > BUSINESS.closeHour ||
-          (hour === BUSINESS.closeHour && minutes > 0) ||
-          (hour === BUSINESS.closeHour - 1 && minutes > 30)
-        ) {
-          return {
-            ok: false,
-            reason: "OUTSIDE_HOURS",
-            message: "That time is outside working hours.",
-          };
-        }
-
-        if (startsAt <= ctx.now) {
-          return {
-            ok: false,
-            reason: "PAST_TIME",
-            message: "That time has already passed.",
-          };
-        }
-
-        const leadCutoff = new Date(
-          ctx.now.getTime() + BUSINESS.leadTimeMinutes * 60_000,
-        );
-        if (startsAt < leadCutoff) {
-          return {
-            ok: false,
-            reason: "TOO_SOON",
-            message: `Appointments must be booked at least ${BUSINESS.leadTimeMinutes} minutes in advance.`,
-          };
-        }
-
-        const horizonDate = new Date(ctx.now);
-        horizonDate.setUTCDate(
-          horizonDate.getUTCDate() + BUSINESS.horizonDays,
-        );
-        if (startsAt > horizonDate) {
-          return {
-            ok: false,
-            reason: "BEYOND_HORIZON",
-            message: `We only book up to ${BUSINESS.horizonDays} days ahead.`,
-          };
-        }
+        const { startsAt, datePart } = validation;
 
         // 2. One live booking per customer at a time — covers both an
         // exact-slot retry and a genuinely different second booking, so a
@@ -643,7 +568,10 @@ export function buildTools(ctx: ToolContext): ToolSet {
               message: "That slot was just taken. Here are some alternatives.",
               alternatives: alts,
             };
-          } catch {
+          } catch (err) {
+            logger.error("computeSlots failed in create_booking SLOT_TAKEN alternatives", {
+              msg: err instanceof Error ? err.message : String(err),
+            });
             return {
               ok: false,
               reason: "SLOT_TAKEN",
@@ -667,7 +595,10 @@ export function buildTools(ctx: ToolContext): ToolSet {
                 "That slot was just booked. Please try another time.",
             };
           }
-        } catch {
+        } catch (err) {
+          logger.error("freeBusy re-check failed in create_booking", {
+            msg: err instanceof Error ? err.message : String(err),
+          });
           await failBooking(ctx.sql, booking.id);
           return {
             ok: false,
@@ -688,7 +619,10 @@ export function buildTools(ctx: ToolContext): ToolSet {
             startLocal: `${parts.date}T${parts.time}:00`,
             endLocal: `${utcToLocalParts(endsAt).date}T${utcToLocalParts(endsAt).time}:00`,
           });
-        } catch {
+        } catch (err) {
+          logger.error("insertEvent failed in create_booking", {
+            msg: err instanceof Error ? err.message : String(err),
+          });
           await failBooking(ctx.sql, booking.id);
           return {
             ok: false,
@@ -768,54 +702,12 @@ export function buildTools(ctx: ToolContext): ToolSet {
           };
         }
 
-        // 2. Validate the new slot — identical rules to create_booking.
-        const [datePart, timePart] = datetime.split("T") as [string, string];
-        const [hourStr, minStr] = (timePart ?? "00:00").split(":") as [string, string];
-        const hour = Number(hourStr);
-        const minutes = Number(minStr);
-
-        if (minutes !== 0 && minutes !== 30) {
-          return {
-            ok: false,
-            reason: "INVALID_SLOT",
-            message: "Appointments are on the hour or half-hour only.",
-          };
+        // 2. Validate the new slot against business policy
+        const validation = validateSlotWithBusiness(datetime, ctx.now);
+        if (!validation.ok) {
+          return { ok: false, reason: validation.reason, message: validation.message };
         }
-
-        const startsAt = localToUtc(datetime);
-        const weekday = localWeekday(startsAt);
-
-        if ((BUSINESS.closedWeekdays as readonly number[]).includes(weekday)) {
-          return { ok: false, reason: "CLOSED_FRIDAY", message: "We are closed on Fridays." };
-        }
-        if (
-          hour < BUSINESS.openHour ||
-          hour > BUSINESS.closeHour ||
-          (hour === BUSINESS.closeHour && minutes > 0) ||
-          (hour === BUSINESS.closeHour - 1 && minutes > 30)
-        ) {
-          return { ok: false, reason: "OUTSIDE_HOURS", message: "That time is outside working hours." };
-        }
-        if (startsAt <= ctx.now) {
-          return { ok: false, reason: "PAST_TIME", message: "That time has already passed." };
-        }
-        const leadCutoff = new Date(ctx.now.getTime() + BUSINESS.leadTimeMinutes * 60_000);
-        if (startsAt < leadCutoff) {
-          return {
-            ok: false,
-            reason: "TOO_SOON",
-            message: `Appointments must be booked at least ${BUSINESS.leadTimeMinutes} minutes in advance.`,
-          };
-        }
-        const horizonDate = new Date(ctx.now);
-        horizonDate.setUTCDate(horizonDate.getUTCDate() + BUSINESS.horizonDays);
-        if (startsAt > horizonDate) {
-          return {
-            ok: false,
-            reason: "BEYOND_HORIZON",
-            message: `We only book up to ${BUSINESS.horizonDays} days ahead.`,
-          };
-        }
+        const { startsAt, datePart } = validation;
 
         // 3. Defensive: any OTHER live booking besides the one being
         // replaced still blocks — the one-at-a-time guardrail should have
@@ -870,7 +762,10 @@ export function buildTools(ctx: ToolContext): ToolSet {
               message: "That slot was just taken. Here are some alternatives. Your original booking is unchanged.",
               alternatives: alts,
             };
-          } catch {
+          } catch (err) {
+            logger.error("computeSlots failed in reschedule_booking SLOT_TAKEN alternatives", {
+              msg: err instanceof Error ? err.message : String(err),
+            });
             return {
               ok: false,
               reason: "SLOT_TAKEN",
@@ -892,7 +787,10 @@ export function buildTools(ctx: ToolContext): ToolSet {
               message: "That slot was just booked. Your original booking is unchanged.",
             };
           }
-        } catch {
+        } catch (err) {
+          logger.error("freeBusy re-check failed in reschedule_booking", {
+            msg: err instanceof Error ? err.message : String(err),
+          });
           await failBooking(ctx.sql, newBookingRow.id);
           return {
             ok: false,
@@ -912,7 +810,10 @@ export function buildTools(ctx: ToolContext): ToolSet {
             startLocal: `${parts.date}T${parts.time}:00`,
             endLocal: `${utcToLocalParts(endsAt).date}T${utcToLocalParts(endsAt).time}:00`,
           });
-        } catch {
+        } catch (err) {
+          logger.error("insertEvent failed in reschedule_booking", {
+            msg: err instanceof Error ? err.message : String(err),
+          });
           await failBooking(ctx.sql, newBookingRow.id);
           return {
             ok: false,
@@ -927,7 +828,7 @@ export function buildTools(ctx: ToolContext): ToolSet {
         if (oldBooking.gcal_event_id) {
           try {
             await ctx.gcal.deleteEvent(oldBooking.gcal_event_id);
-          } catch {
+          } catch (err) {
             // Best effort: the new booking is already confirmed and live,
             // so the old one must still be marked cancelled below even if
             // its Calendar event couldn't be removed — otherwise the
@@ -994,9 +895,12 @@ export function buildTools(ctx: ToolContext): ToolSet {
                 },
               };
             }
-          } catch {
+          } catch (err) {
             // Calendar check failed — fall back to trusting our own DB
             // record rather than blocking the lookup entirely.
+            logger.warn("getEvent failed in get_my_booking — falling back to DB record", {
+              msg: err instanceof Error ? err.message : String(err),
+            });
           }
         }
 
@@ -1067,7 +971,10 @@ export function buildTools(ctx: ToolContext): ToolSet {
         if (booking.gcal_event_id) {
           try {
             await ctx.gcal.deleteEvent(booking.gcal_event_id);
-          } catch {
+          } catch (err) {
+            logger.error("deleteEvent failed in cancel_booking", {
+              msg: err instanceof Error ? err.message : String(err),
+            });
             return {
               ok: false,
               reason: "CALENDAR_ERROR",
