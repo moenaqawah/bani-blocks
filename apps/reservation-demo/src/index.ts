@@ -11,7 +11,7 @@
  */
 
 import { Hono } from "hono";
-import { createDb } from "@bani/db";
+import { createDb, expireStaleDrafts } from "@bani/db";
 import { createGcalClient } from "@bani/gcal-tool";
 import {
   verifyWebhookGet,
@@ -405,4 +405,41 @@ async function processMessage(
   );
 }
 
-export default app;
+// ─── scheduled: draft expiry ─────────────────────────────────────────
+
+/**
+ * Retire visit drafts past their TTL (ADR-004 A.4).
+ *
+ * Never touches `bookings`: a half-finished visit's booked groups are
+ * ordinary appointments and outlive the draft that produced them.
+ */
+async function expireDrafts(env: WorkerEnv): Promise<void> {
+  const useHyperdrive = env.HYPERDRIVE !== undefined;
+  const sql = createDb(
+    env.HYPERDRIVE?.connectionString ?? env.DATABASE_URL ?? "",
+    useHyperdrive ? { ssl: false } : undefined,
+  );
+  try {
+    const expired = await expireStaleDrafts(sql, new Date());
+    if (expired > 0) logger.info("Expired stale visit drafts", { msg: `count=${expired}` });
+  } finally {
+    await sql.end();
+  }
+}
+
+export default {
+  fetch: app.fetch,
+  scheduled(
+    _event: unknown,
+    env: WorkerEnv,
+    execCtx: { waitUntil: (p: Promise<unknown>) => void },
+  ): void {
+    execCtx.waitUntil(
+      expireDrafts(env).catch((err) =>
+        logger.error("Draft expiry job failed", {
+          msg: err instanceof Error ? err.message : String(err),
+        }),
+      ),
+    );
+  },
+};

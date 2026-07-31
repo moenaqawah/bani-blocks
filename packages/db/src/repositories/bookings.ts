@@ -287,6 +287,30 @@ export async function findUpcomingLiveBookingsForCustomer(
 }
 
 /**
+ * Appointments the customer has already had.
+ *
+ * Kept separate from the upcoming query on purpose: history is only wanted
+ * when asked for, whereas upcoming bookings are loaded on every turn. Both
+ * cancelled and completed rows are excluded — this answers "what have I had
+ * done", not "what did I once book".
+ */
+export async function findPastBookingsForCustomer(
+  sql: Sql,
+  customerId: string,
+  now: Date,
+  limit = 5,
+): Promise<Booking[]> {
+  return sql<Booking[]>`
+    select * from bookings
+    where customer_id = ${customerId}
+      and starts_at <= ${now}
+      and status = 'confirmed'
+    order by starts_at desc
+    limit ${limit}
+  `;
+}
+
+/**
  * Count distinct visits (booking_group_id) with ≥1 upcoming live booking.
  * This is the per-customer cap guard — counts visits, not individual rows.
  */

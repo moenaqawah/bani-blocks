@@ -58,6 +58,23 @@ export interface Booking {
   updated_at: Date;
 }
 
+/**
+ * One in-progress visit (ADR-004). `groups` and `pending_question` are opaque
+ * JSON at this layer — the app maps them to the orchestrator's domain types.
+ */
+export interface VisitDraftRow {
+  id: string;
+  customer_id: string;
+  conversation_id: string | null;
+  visit_date: string | null;
+  groups: unknown;
+  status: "gathering" | "active" | "completed" | "expired" | "abandoned";
+  pending_question: unknown;
+  expires_at: Date;
+  created_at: Date;
+  updated_at: Date;
+}
+
 export interface RateLimitWindow {
   bucket_key: string;
   window_start: Date;

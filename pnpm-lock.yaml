@@ -17,12 +17,18 @@ importers:
       '@bani/agent-core':
         specifier: workspace:*
         version: link:../../packages/agent-core
+      '@bani/availability':
+        specifier: workspace:*
+        version: link:../../packages/availability
       '@bani/db':
         specifier: workspace:*
         version: link:../../packages/db
       '@bani/gcal-tool':
         specifier: workspace:*
         version: link:../../packages/gcal-tool
+      '@bani/orchestrator':
+        specifier: workspace:*
+        version: link:../../packages/orchestrator
       '@bani/shared':
         specifier: workspace:*
         version: link:../../packages/shared
@@ -84,6 +90,20 @@ importers:
       zod:
         specifier: 4.4.3
         version: 4.4.3
+    devDependencies:
+      '@types/node':
+        specifier: 26.1.1
+        version: 26.1.1
+
+  packages/availability:
+    dependencies:
+      '@bani/shared':
+        specifier: workspace:*
+        version: link:../shared
+    devDependencies:
+      '@types/node':
+        specifier: 26.1.1
+        version: 26.1.1
 
   packages/db:
     dependencies:
@@ -99,6 +119,19 @@ importers:
       '@bani/shared':
         specifier: workspace:*
         version: link:../shared
+
+  packages/orchestrator:
+    dependencies:
+      '@bani/availability':
+        specifier: workspace:*
+        version: link:../availability
+      '@bani/shared':
+        specifier: workspace:*
+        version: link:../shared
+    devDependencies:
+      '@types/node':
+        specifier: 26.1.1
+        version: 26.1.1
 
   packages/shared: {}
 

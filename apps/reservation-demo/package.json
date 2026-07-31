@@ -8,8 +8,10 @@
   },
   "dependencies": {
     "@bani/agent-core": "workspace:*",
+    "@bani/availability": "workspace:*",
     "@bani/db": "workspace:*",
     "@bani/gcal-tool": "workspace:*",
+    "@bani/orchestrator": "workspace:*",
     "@bani/shared": "workspace:*",
     "@bani/whatsapp-adapter": "workspace:*",
     "ai": "6.0.235",

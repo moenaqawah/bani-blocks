@@ -9,7 +9,7 @@
 
 export const AMMAN_OFFSET_MIN = 180;
 
-const WEEKDAY_EN = [
+export const WEEKDAY_EN = [
   "Sunday",
   "Monday",
   "Tuesday",
@@ -19,7 +19,7 @@ const WEEKDAY_EN = [
   "Saturday",
 ] as const;
 
-const WEEKDAY_AR = [
+export const WEEKDAY_AR = [
   "الأحد",
   "الاثنين",
   "الثلاثاء",
@@ -104,70 +104,6 @@ export function slotGrid(localDate: string): Date[] {
     }
   }
   return slots;
-}
-
-/**
- * Booking confirmation details for formatConfirmation.
- */
-export interface ConfirmationBooking {
-  ref: string;
-  startsAt: Date;
-  services: string[];         // service names in the customer's language
-  resourceName: string;       // employee name in the customer's language
-  durationMinutes: number;
-}
-
-/**
- * Format a canonical confirmation block from booking rows.
- * Code-rendered — the model never writes the date or ref.
- * Returns a block suitable for appending after the model's warm text.
- */
-export function formatConfirmation(
-  bookings: ConfirmationBooking[],
-  locale: "ar" | "en",
-): string {
-  if (bookings.length === 0) return "";
-
-  const lines: string[] = [];
-  lines.push(""); // blank line separator from model text
-
-  for (const b of bookings) {
-    const parts = utcToLocalParts(b.startsAt);
-    const endTime = new Date(b.startsAt.getTime() + b.durationMinutes * 60_000);
-    const endParts = utcToLocalParts(endTime);
-
-    if (locale === "ar") {
-      const monthAr = MONTHS_AR[new Date(
-        b.startsAt.getTime() + AMMAN_OFFSET_MIN * 60_000,
-      ).getUTCMonth()];
-      lines.push(
-        `${parts.weekdayAr} ${new Date(b.startsAt.getTime() + AMMAN_OFFSET_MIN * 60_000).getUTCDate()} ${monthAr} ${new Date(b.startsAt.getTime() + AMMAN_OFFSET_MIN * 60_000).getUTCFullYear()}`,
-      );
-      lines.push(
-        `${parts.time}${" مساءً"}` + (endParts.time !== parts.time ? ` — ${endParts.time} مساءً` : ""),
-      );
-      const svcText = b.services.join(" + ");
-      lines.push(`${svcText}، مع ${b.resourceName}`);
-      lines.push(`رقم الحجز ${b.ref}`);
-      lines.push("لإلغاء الحجز ابعتلي رقم الحجز");
-    } else {
-      // English
-      lines.push(
-        `${parts.weekdayEn} ${parts.human}`,
-      );
-      const svcText = b.services.join(" + ");
-      lines.push(`${svcText} with ${b.resourceName}`);
-      lines.push(`Ref ${b.ref}`);
-      lines.push("To cancel, send me the booking reference.");
-    }
-
-    // Separator between bundles
-    if (bookings.length > 1) {
-      lines.push("");
-    }
-  }
-
-  return lines.join("\n");
 }
 
 /**

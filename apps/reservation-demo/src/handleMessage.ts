@@ -1,42 +1,23 @@
 import type { Sql } from "postgres";
 import type { GcalClient } from "@bani/gcal-tool";
 import {
-  loadHistory,
+  getOrCreateOpenConversation,
   insertInbound,
   insertOutbound,
   insertToolRow,
-  touchConversation,
-  getOrCreateOpenConversation,
-  upsertCustomer,
-  setCustomerLocale,
+  loadHistory,
   markConsent,
+  setCustomerLocale,
+  touchConversation,
+  upsertCustomer,
   withConversationLock,
-  findUpcomingLiveBookingsForCustomer,
-  findBookingsByGroupId,
   type InboundRow,
 } from "@bani/db";
 import { sendText } from "@bani/whatsapp-adapter";
-import {
-  getModel,
-  buildMemory,
-  runAgent,
-} from "@bani/agent-core";
-import {
-  logger,
-  hashPhone,
-  AppError,
-  formatConfirmation,
-  type ConfirmationBooking,
-} from "@bani/shared";
-import { buildSystemPrompt } from "./prompt.js";
-import { buildTools, type ToolContext } from "./tools.js";
-import { SERVICES, RESOURCES } from "./config.js";
-import {
-  CONSENT_LINE,
-  bilingualMsg,
-  detectLocale,
-  type CannedKey,
-} from "./i18n.js";
+import { buildMemory, getModel } from "@bani/agent-core";
+import { AppError, hashPhone, logger } from "@bani/shared";
+import { runConversationTurn } from "./turn.js";
+import { CONSENT_LINE, bilingualMsg, detectLocale, type CannedKey } from "./i18n.js";
 
 export interface HandleMessageEnv {
   // DB
@@ -52,12 +33,12 @@ export interface HandleMessageEnv {
   OPENAI_API_KEY?: string;
   ANTHROPIC_API_KEY?: string;
   GROQ_API_KEY?: string;
-  // Agent
+  // Conversation history shown to the translator
   AGENT_HISTORY_LIMIT: number;
   AGENT_HISTORY_MAX_AGE_HOURS: number;
   // Calendar
   GCAL_CALENDAR_ID: string;
-  GCAL_CALENDARS?: string;    // JSON: {"muna":"...","rana":"..."}
+  GCAL_CALENDARS?: string; // JSON: {"muna":"...","rana":"..."}
   GCAL_SA_EMAIL: string;
   GCAL_SA_PRIVATE_KEY: string;
   // Demo
@@ -75,25 +56,21 @@ export interface InboundContext {
 
 // ─── WhatsApp send + persist helper ──────────────────────────────────
 
-interface SendParams {
-  to: string;
-  env: HandleMessageEnv;
-}
-
 async function sendAndPersist(
   sql: Sql,
-  params: SendParams,
+  to: string,
+  env: HandleMessageEnv,
   body: string,
   conversationId: string,
   customerId: string,
   toolName?: string,
 ): Promise<void> {
   const results = await sendText({
-    to: params.to,
+    to,
     body,
-    phoneNumberId: params.env.WHATSAPP_PHONE_NUMBER_ID,
-    accessToken: params.env.WHATSAPP_ACCESS_TOKEN,
-    graphVersion: params.env.WHATSAPP_GRAPH_VERSION,
+    phoneNumberId: env.WHATSAPP_PHONE_NUMBER_ID,
+    accessToken: env.WHATSAPP_ACCESS_TOKEN,
+    graphVersion: env.WHATSAPP_GRAPH_VERSION,
   });
 
   for (const r of results) {
@@ -115,9 +92,7 @@ function withConsentPrefix(body: string, isNewConv: boolean): string {
 }
 
 async function markConsentIfNew(sql: Sql, customerId: string, isNewConv: boolean): Promise<void> {
-  if (isNewConv) {
-    await markConsent(sql, customerId).catch(() => {});
-  }
+  if (isNewConv) await markConsent(sql, customerId).catch(() => {});
 }
 
 // ─── media fallback ──────────────────────────────────────────────────
@@ -135,16 +110,13 @@ async function handleMediaFallback(
 
   const customer = await upsertCustomer(sql, ctx.from, ctx.profileName);
   const conv = await getOrCreateOpenConversation(sql, customer.id, new Date());
-
   const isNewConv = conv.last_user_message_at === null;
-  const mediaMsg = withConsentPrefix(bilingualMsg("MEDIA", customer.locale), isNewConv);
+  const body = withConsentPrefix(bilingualMsg("MEDIA", customer.locale), isNewConv);
 
-  await sendAndPersist(sql, { to: ctx.from, env }, mediaMsg, conv.id, customer.id, "fallback_media");
+  await sendAndPersist(sql, ctx.from, env, body, conv.id, customer.id, "fallback_media");
   await touchConversation(sql, conv.id, false);
   await markConsentIfNew(sql, customer.id, isNewConv);
 }
-
-// ─── canned reply ────────────────────────────────────────────────────
 
 async function sendCannedReply(
   sql: Sql,
@@ -157,85 +129,11 @@ async function sendCannedReply(
   cannedKey: CannedKey,
 ): Promise<void> {
   const body = withConsentPrefix(bilingualMsg(cannedKey, locale), isNewConv);
-  await sendAndPersist(sql, { to: ctx.from, env }, body, conversationId, customerId);
+  await sendAndPersist(sql, ctx.from, env, body, conversationId, customerId);
   await markConsentIfNew(sql, customerId, isNewConv);
 }
 
-// ─── confirmation block helpers ──────────────────────────────────────
-
-/**
- * Extract the bookingGroupId from create_bookings tool output.
- * Returns undefined if no create_bookings call was made or none succeeded.
- */
-function extractBookingGroupId(
-  steps: Array<{ toolName: string; output: unknown }>,
-): string | undefined {
-  for (const step of steps) {
-    if (step.toolName !== "create_bookings") continue;
-    const out = step.output as Record<string, unknown> | undefined;
-    if (!out?.bookingGroupId) continue;
-    // Check that at least one bundle succeeded
-    const results = out.results as Array<{ ok?: boolean }> | undefined;
-    if (results?.some((r) => r.ok === true)) {
-      return out.bookingGroupId as string;
-    }
-  }
-  return undefined;
-}
-
-/**
- * Build the confirmation block from ACTUAL DB booking rows using the
- * bookingGroupId from create_bookings output. This is more reliable than
- * a time-window query — it links exactly to this booking attempt.
- */
-async function extractConfirmations(
-  sql: Sql,
-  bookingGroupId: string,
-  customerLocale: "ar" | "en",
-): Promise<string> {
-  const rows = await findBookingsByGroupId(sql, bookingGroupId);
-
-  if (rows.length === 0) return "";
-
-  // Group by bundle
-  const byBundle = new Map<string, typeof rows>();
-  for (const r of rows) {
-    const key = r.bundle_id;
-    if (!byBundle.has(key)) byBundle.set(key, []);
-    byBundle.get(key)!.push(r);
-  }
-
-  const bookings: ConfirmationBooking[] = [];
-  for (const [, bundleRows] of byBundle) {
-    const first = bundleRows[0]!;
-    const totalDur = bundleRows.reduce((sum, r) => {
-      const dur = SERVICES.find((s) => s.code === r.service_code)?.durationMinutes ?? 30;
-      return sum + dur;
-    }, 0);
-
-    const svcNames = bundleRows.map((r) => {
-      const cfg = SERVICES.find((s) => s.code === r.service_code);
-      return customerLocale === "ar" ? (cfg?.ar ?? r.service_code) : (cfg?.en ?? r.service_code);
-    });
-
-    const rInfo = RESOURCES.find((x) => x.code === first.resource_code);
-    const resourceName = customerLocale === "ar"
-      ? (rInfo?.ar ?? first.resource_code)
-      : (rInfo?.en ?? first.resource_code);
-
-    bookings.push({
-      ref: first.ref,
-      startsAt: new Date(first.starts_at),
-      services: svcNames,
-      resourceName,
-      durationMinutes: totalDur,
-    });
-  }
-
-  return formatConfirmation(bookings, customerLocale);
-}
-
-// ─── agent pipeline ──────────────────────────────────────────────────
+// ─── pipeline ────────────────────────────────────────────────────────
 
 interface PipelineParams {
   sql: Sql;
@@ -243,82 +141,52 @@ interface PipelineParams {
   ctx: InboundContext;
   env: HandleMessageEnv;
   customerId: string;
+  customerName: string | null;
   conversationId: string;
   locale: "ar" | "en";
   isNewConv: boolean;
   inboundId: string;
-  phoneHash: string;
 }
 
-async function runAgentPipeline(params: PipelineParams): Promise<void> {
-  const { sql, gcal, ctx, env, customerId, conversationId, locale, isNewConv, inboundId, phoneHash } = params;
+async function runPipeline(params: PipelineParams): Promise<void> {
+  const { sql, ctx, env, customerId, conversationId, locale, isNewConv } = params;
+  const now = new Date();
 
-  // Load history
-  const historyCutoff = new Date(
-    Date.now() - env.AGENT_HISTORY_MAX_AGE_HOURS * 60 * 60 * 1000,
+  const historyCutoff = new Date(now.getTime() - env.AGENT_HISTORY_MAX_AGE_HOURS * 60 * 60 * 1000);
+  const history = buildMemory(
+    await loadHistory(sql, conversationId, env.AGENT_HISTORY_LIMIT, params.inboundId, historyCutoff),
   );
-  const rows = await loadHistory(
+
+  const outcome = await runConversationTurn({
     sql,
-    conversationId,
-    env.AGENT_HISTORY_LIMIT,
-    inboundId,
-    historyCutoff,
-  );
-  const memory = buildMemory(rows);
-
-  // Fetch current bookings for injection
-  const currentBookings = await findUpcomingLiveBookingsForCustomer(
-    sql, customerId, new Date(),
-  );
-
-  // Build tools and model
-  const toolCtx: ToolContext = {
-    sql,
-    gcal,
+    gcal: params.gcal,
+    model: getModel(env),
     customerId,
     conversationId,
+    customerName: params.customerName,
     waPhone: ctx.from,
-    now: new Date(),
-  };
-  const tools = buildTools(toolCtx);
-  const model = getModel(env);
-  const systemPrompt = buildSystemPrompt(new Date(), locale, currentBookings);
-  const userText = (ctx.text ?? "").slice(0, 4000);
-
-  // Run the agent
-  const result = await runAgent({
-    systemPrompt,
-    history: memory,
-    userText,
-    tools,
-    model,
-    maxSteps: 10,
+    history,
+    userText: (ctx.text ?? "").slice(0, 4000),
+    locale,
+    now,
   });
 
-  // Persist tool steps (include errorMessage so we can debug failures)
-  for (const step of result.steps) {
-    await insertToolRow(sql, {
-      conversationId,
-      customerId,
-      toolName: step.toolName,
-      payload: {
-        input: step.input,
-        output: step.output,
-        ...(step.errorMessage ? { error: step.errorMessage } : {}),
-      },
-    });
-  }
+  // Intents and transitions are better eval data than tool payloads ever were.
+  await insertToolRow(sql, {
+    conversationId,
+    customerId,
+    toolName: "turn",
+    payload: { input: outcome.intents, output: outcome.blocks.map((b) => b.kind) },
+  }).catch((err) => logger.warn("failed to log turn", { msg: String(err) }));
 
-  // Build confirmation block using bookingGroupId from create_bookings output.
-  // The model MUST NOT write confirmation text — the system appends this block.
-  const bookingGroupId = extractBookingGroupId(result.steps);
-  const confirmationBlock = bookingGroupId
-    ? await extractConfirmations(sql, bookingGroupId, locale)
-    : "";
-
-  // Send reply
-  const reply = withConsentPrefix(result.text + confirmationBlock, isNewConv);
-  await sendAndPersist(sql, { to: ctx.from, env }, reply, conversationId, customerId);
+  await sendAndPersist(
+    sql,
+    ctx.from,
+    env,
+    withConsentPrefix(outcome.text, isNewConv),
+    conversationId,
+    customerId,
+  );
   await markConsentIfNew(sql, customerId, isNewConv);
   await touchConversation(sql, conversationId, true);
 }
@@ -344,7 +212,6 @@ export async function handleMessage(
   const customer = await upsertCustomer(sql, ctx.from, ctx.profileName);
   const locale = detectLocale(ctx.text);
   await setCustomerLocale(sql, customer.id, locale);
-
   const conv = await getOrCreateOpenConversation(sql, customer.id, new Date());
 
   // 3. Persist inbound (skip if duplicate)
@@ -356,30 +223,29 @@ export async function handleMessage(
   };
   const inbound = await insertInbound(sql, inboundRow);
   if (!inbound) {
-    logger.debug("Duplicate message — skipping", {
-      waPhoneHash: phoneHash,
-      wamid: ctx.waMessageId,
-    });
+    logger.debug("Duplicate message — skipping", { waPhoneHash: phoneHash, wamid: ctx.waMessageId });
     return;
   }
 
-  // 4. Run agent pipeline inside conversation lock, deferred
+  // 4. Run the turn inside the conversation lock, deferred
   const isNewConv = conv.last_user_message_at === null;
-
-  const pipelineParams: PipelineParams = {
-    sql, gcal, ctx, env,
+  const params: PipelineParams = {
+    sql,
+    gcal,
+    ctx,
+    env,
     customerId: customer.id,
+    customerName: customer.display_name,
     conversationId: conv.id,
     locale,
     isNewConv,
     inboundId: inbound.id,
-    phoneHash,
   };
 
   defer(
     withConversationLock(sql, conv.id, async () => {
       try {
-        await runAgentPipeline(pipelineParams);
+        await runPipeline(params);
       } catch (err) {
         logger.error("handleMessage failed", {
           waPhoneHash: phoneHash,
@@ -387,32 +253,27 @@ export async function handleMessage(
           msg: err instanceof Error ? err.message : String(err),
         });
 
-        const cannedKey = err instanceof AppError && err.kind === "LLM_RATE" ? "BUSY" : "ERROR";
-
-        try {
-          await sendCannedReply(sql, ctx, env, conv.id, customer.id, locale, isNewConv, cannedKey);
-        } catch (sendErr) {
-          logger.error("Failed to send canned error message", {
-            waPhoneHash: phoneHash,
-            msg: sendErr instanceof Error ? sendErr.message : String(sendErr),
-          });
-        }
-      }
-    }).then((lockResult) => {
-      if (lockResult === "LOCK_TIMEOUT") {
-        defer(
-          (async () => {
-            try {
-              await sendCannedReply(sql, ctx, env, conv.id, customer.id, locale, isNewConv, "BUSY");
-            } catch (sendErr) {
-              logger.error("Failed to send BUSY message for LOCK_TIMEOUT", {
-                waPhoneHash: phoneHash,
-                msg: sendErr instanceof Error ? sendErr.message : String(sendErr),
-              });
-            }
-          })(),
+        const cannedKey: CannedKey =
+          err instanceof AppError && err.kind === "LLM_RATE" ? "BUSY" : "ERROR";
+        await sendCannedReply(sql, ctx, env, conv.id, customer.id, locale, isNewConv, cannedKey).catch(
+          (sendErr) =>
+            logger.error("Failed to send canned error message", {
+              waPhoneHash: phoneHash,
+              msg: sendErr instanceof Error ? sendErr.message : String(sendErr),
+            }),
         );
       }
+    }).then((lockResult) => {
+      if (lockResult !== "LOCK_TIMEOUT") return;
+      defer(
+        sendCannedReply(sql, ctx, env, conv.id, customer.id, locale, isNewConv, "BUSY").catch(
+          (sendErr) =>
+            logger.error("Failed to send BUSY message for LOCK_TIMEOUT", {
+              waPhoneHash: phoneHash,
+              msg: sendErr instanceof Error ? sendErr.message : String(sendErr),
+            }),
+        ),
+      );
     }),
   );
 }

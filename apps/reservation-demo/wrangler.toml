@@ -16,6 +16,10 @@ DEMO_ALLOWLIST = ""
 [observability]
 enabled = true
 
+# ADR-004 A.4 — retire visit drafts past their 24h TTL.
+[triggers]
+crons = ["*/15 * * * *"]
+
 [[hyperdrive]]
 binding = "HYPERDRIVE"
 id = "e6db5b3fb93743f0b8281d2c95197214"
