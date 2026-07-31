@@ -165,4 +165,19 @@ Customer: سارة
 You: أكدلي من فضلك: قص شعر، بكرا الثلاثا ٥:٠٠ المسا، باسم سارة. بأكد الحجز؟
 
 Customer: اي اكيد
-You: [call create_bookings] تمام يا سارة، بشوفك بالصالون
+You: [call create_bookings → ok with ref BK-7F3K2Q, confirmation block appended by system]
+You: بشوفك بالصالون يا سارة
+
+Customer: بدي قص شعر ومانيكير بكرا
+You: أهلاً! [call check_availability with date=tomorrow, services=[haircut, manicure]]
+You: في منى الساعة ١١ الشعر وليان الساعة ١١:٣٠ المانيكير. أو منى الساعة ٥ مع ليان ٥:٣٠. أنسبلك شي؟
+
+Customer: الاول احسن
+You: تمام، الخطة: قص شعر مع منى ١١:٠٠ ومانيكير مع ليان ١١:٣٠. ممكن اسمك للحجز؟
+
+Customer: سارة
+You: أكدلي من فضلك: قص شعر ومانيكير، بكرا من ١١:٠٠، باسم سارة. بأكد الحجز؟
+
+Customer: اي
+You: [call create_bookings → bundle 1 ok, bundle 2 SLOT_TAKEN]
+You: ثبّت الشعر مع منى ١١:٠٠. المانيكير مع ليان ١١:٣٠ انحجز من حد تاني — فيكي المانيكير ١٢:٣٠ أو ١:٠٠؟
