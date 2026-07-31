@@ -201,46 +201,6 @@ export function formatDay(date: string, locale: Locale): string {
 
 // ─── fallback ───────────────────────────────────────────────────────────
 
-/**
- * Short openers for the verdicts most likely to be seen during an outage.
- *
- * This is the only hand-written copy left, and it is deliberately bounded:
- * it exists so a rate-limited reply still reads like a sentence rather than a
- * field dump. Anything not listed falls back to its verdict name, which is
- * ugly but never wrong. Do not grow this into a template pack.
- */
-const VERDICT_PREFIX: Partial<Record<ReplyBlock["kind"], { ar: string; en: string }>> = {
-  booked: { ar: "تم الحجز ✅", en: "Booked ✅" },
-  cancelled: { ar: "تم الإلغاء ✅", en: "Cancelled ✅" },
-  ask_cancel_confirm: { ar: "بتأكد إلغاء", en: "Confirm cancelling" },
-  offer_slots: { ar: "الأوقات المتاحة", en: "Available times" },
-  slot_not_offered: { ar: "هاد الوقت مش متاح — المتاح", en: "Not available — these are" },
-  slot_taken: { ar: "الوقت انحجز قبل شوي", en: "That time was just taken" },
-  no_slots: { ar: "ما في وقت متاح", en: "No times available" },
-  closed_day: { ar: "الصالون مسكّر", en: "We're closed" },
-  cannot_answer: {
-    ar: "بس بقدر أساعدك بالمواعيد — اتصلي بالصالون لهالسؤال",
-    en: "I can only help with appointments — please call the salon for that",
-  },
-  no_bookings: { ar: "ما عندك مواعيد", en: "No appointments" },
-  past_bookings: { ar: "مواعيدك السابقة", en: "Your past appointments" },
-  chitchat: { ar: "تكرم عينك", en: "Happy to help" },
-  greeting: { ar: "أهلاً وسهلاً في صالون ليالي", en: "Welcome to Layali Salon" },
-  unclear: { ar: "ما فهمت عليكِ، ممكن تعيدي", en: "Sorry, could you say that again" },
-  visit_complete: { ar: "تم كل شي، بنستناكِ", en: "All set — see you then" },
-  calendar_error: { ar: "في خلل تقني، جربي بعد شوي", en: "Technical problem — please try again shortly" },
-  customer_busy: { ar: "عندك حجز بنفس الوقت", en: "You already have an appointment then" },
-  too_soon: { ar: "لازم وقت أطول قبل الموعد", en: "That's too soon to book" },
-  cancel_aborted: { ar: "تمام، ما لغينا إشي", en: "No problem — nothing was cancelled" },
-  nothing_to_cancel: { ar: "ما عندك مواعيد للإلغاء", en: "You have no appointments to cancel" },
-  draft_replaced: { ar: "تمام، تركنا القديم", en: "Sure — I've set that one aside" },
-  no_capable_employee: { ar: "ما عنا حدا بيعمل هالخدمة", en: "Nobody on the team does that service" },
-  ask_date: { ar: "أي يوم بناسبك؟", en: "Which day suits you?" },
-  ask_services: { ar: "شو الخدمة اللي بدك ياها؟", en: "Which service would you like?" },
-  current_bookings: { ar: "حجوزاتك الجاية", en: "Your upcoming appointments" },
-  which_booking: { ar: "أي حجز بتقصد", en: "Which appointment do you mean" },
-};
-
 /** Rendering hints, not values a customer needs to read. */
 const STRUCTURAL_FIELDS = new Set(["more", "remainingGroups"]);
 
@@ -254,7 +214,10 @@ function renderFallback(blocks: readonly ResolvedBlock[], locale: Locale): strin
 }
 
 function fallbackLine(block: ResolvedBlock, locale: Locale): string {
-  const prefix = VERDICT_PREFIX[block.verdict]?.[locale] ?? block.verdict.replace(/_/g, " ");
+  // The verdict name itself, unprettified. This is the outage path: it must be
+  // correct and complete, and it deliberately carries no maintained copy —
+  // per-language openers here are a template pack growing back.
+  const prefix = block.verdict.replace(/_/g, " ");
   const parts: string[] = [];
 
   for (const [field, value] of Object.entries(block)) {

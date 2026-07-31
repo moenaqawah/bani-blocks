@@ -86,20 +86,6 @@ State: any.
 "شو الحجوزات القديمة تبعي؟"
 → [{ kind: "list_bookings", scope: "past" }]
 
-State: PENDING QUESTION which of the numbered appointments.
-UPCOMING BOOKINGS: 1. BK-AAA111 haircut ... 2. BK-BBB222 manicure ...
-"الأول"
-→ [{ kind: "cancel", ref: "BK-AAA111" }]        // ordinal resolves against the list
-
-State: PENDING QUESTION which of the numbered appointments.
-UPCOMING BOOKINGS: 1. BK-AAA111 haircut ... 2. BK-BBB222 manicure ...
-"cancel all of them"
-→ [{ kind: "cancel", scope: "all" }]
-
-State: UPCOMING BOOKINGS: 1. BK-AAA111 haircut ... 2. BK-BBB222 manicure ...
-"ألغي المانيكير"
-→ [{ kind: "cancel", ref: "BK-BBB222" }]        // named by service, not by code
-
 State: any.
 "شو أسعاركم؟"
 → [{ kind: "question", text: "What are your prices?" }]
