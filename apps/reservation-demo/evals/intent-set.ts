@@ -285,6 +285,11 @@ export const INTENT_CASES: IntentCase[] = [
   { id: "T46", locale: "en", message: "hi there", state: base(), expect: [{ kind: "chitchat" }] },
   { id: "T47", locale: "ar", message: "شكرا كتير 🌸", state: base(), expect: [{ kind: "chitchat" }] },
   { id: "T48", locale: "en", message: "thanks!", state: awaiting(), expect: [{ kind: "chitchat" }] },
+  // Reported 2026-08-01: a hello after a goodbye was answered as a goodbye.
+  // All of these stay one kind — the renderer sees the words and replies.
+  { id: "T48a", locale: "ar", message: "مع السلامة", state: base(), expect: [{ kind: "chitchat" }] },
+  { id: "T48b", locale: "en", message: "bye, thanks", state: base(), expect: [{ kind: "chitchat" }] },
+  { id: "T48c", locale: "ar", message: "يعطيك العافية", state: base(), expect: [{ kind: "chitchat" }] },
 
   // ── unclear ───────────────────────────────────────────────────────
   { id: "T49", locale: "en", message: "asdkjhasd", state: base(), expect: [{ kind: "unclear" }] },

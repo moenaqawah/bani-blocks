@@ -28,7 +28,7 @@ import { ORCHESTRATOR_CONFIG, type Locale } from "./salon.js";
 import { loadState, saveState } from "./state-store.js";
 import { resolveReply } from "./reply-payload.js";
 import { TRANSLATOR_PROMPT } from "./translator-prompt.js";
-import { VERDICT_GUIDE } from "./verdicts.js";
+import { verdictGuideFor } from "./verdicts.js";
 import { STYLE_PROMPT } from "./voice.js";
 
 export interface TurnParams {
@@ -54,15 +54,44 @@ export interface TurnOutcome {
 }
 
 export async function runConversationTurn(params: TurnParams): Promise<TurnOutcome> {
+  // Phase timings, so a latency complaint can be answered with numbers rather
+  // than a guess about which of the two model calls is slow.
+  const mark = timer();
+
   const state = await loadState(params.sql, params.customerId, params.now, params.customerName);
+  const load = mark();
 
   const intents = await labelMessage(params, state);
+  const translate = mark();
+
   const { state: settled, blocks } = await applyIntents(params, state, intents);
+  const orchestrate = mark();
 
   await saveState(params.sql, settled, params.customerId, params.conversationId, params.now);
+  const save = mark();
 
   const text = await composeReply(params, blocks);
+  const render = mark();
+
+  logger.info("turn timing", {
+    msg:
+      `load=${load}ms translate=${translate}ms orchestrate=${orchestrate}ms ` +
+      `save=${save}ms render=${render}ms total=${load + translate + orchestrate + save + render}ms ` +
+      `effects=${blocks.length}b`,
+  });
+
   return { ...text, intents, blocks };
+}
+
+/** Returns a function that reports ms elapsed since the previous call. */
+function timer(): () => number {
+  let previous = Date.now();
+  return () => {
+    const now = Date.now();
+    const delta = now - previous;
+    previous = now;
+    return delta;
+  };
 }
 
 // ─── layer 1 ────────────────────────────────────────────────────────────
@@ -138,12 +167,26 @@ async function composeReply(
     fallbackText: resolved.fallbackText,
     locale: params.locale,
     stylePrompt: STYLE_PROMPT,
-    verdictGuide: VERDICT_GUIDE,
+    verdictGuide: verdictGuideFor(resolved.blocks.map((b) => b.verdict)),
     // History is loaded for the translator; the renderer only needs to know
     // that there IS some, so it stops greeting on every turn.
     continuing: params.history.length > 0,
     customerName: params.customerName,
+    // Only when the whole turn is conversation: no facts stated, nothing done.
+    ...(isPureConversation(resolved.blocks) ? { customerSaid: params.userText } : {}),
   });
 
   return { text: polished.text, fellBack: polished.fellBack };
+}
+
+/**
+ * True when the reply carries no facts and reports no action — the only case
+ * where showing the renderer the customer's own words helps rather than
+ * tempts. On any turn that states a time, a reference or an outcome, the words
+ * are withheld: the decision is the orchestrator's, and the renderer's job is
+ * to phrase it, not to reconsider it.
+ */
+function isPureConversation(blocks: readonly { verdict: string }[]): boolean {
+  const CONVERSATIONAL = new Set(["chitchat", "greeting", "unclear"]);
+  return blocks.length > 0 && blocks.every((b) => CONVERSATIONAL.has(b.verdict));
 }

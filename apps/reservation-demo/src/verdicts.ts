@@ -15,9 +15,8 @@ import { SPEECH_ACTS } from "@bani/orchestrator";
 const MEANINGS: Record<keyof typeof SPEECH_ACTS, string> = {
   greeting: "A first hello. Welcome them and ask what they need.",
   chitchat:
-    "Small talk with nothing to act on. If they are THANKING YOU or signing off, simply accept " +
-    "it warmly and let the conversation end — do NOT ask what else they need, and do not " +
-    "re-open a conversation that is finished. Only offer help when they are opening one.",
+    "Conversation, not a request — a hello, a thank you, a goodbye, a passing remark. Their exact " +
+    "words are given below; just reply to them like a person would. Nothing has to happen.",
   unclear: "Their message could not be understood. Apologise lightly and ask them to rephrase.",
 
   ask_services: "We do not yet know which service they want. Ask.",
@@ -90,10 +89,21 @@ const MEANINGS: Record<keyof typeof SPEECH_ACTS, string> = {
     "appointments, suggest they call the salon for that, and offer to book something.",
 };
 
-/** Rendered once into the renderer's system prompt. */
-export const VERDICT_GUIDE = [
-  "## What each verdict means",
-  "",
-  ...Object.entries(MEANINGS)
-    .map(([verdict, meaning]) => `- **${verdict}** (${SPEECH_ACTS[verdict as keyof typeof SPEECH_ACTS]}): ${meaning}`),
-].join("\n");
+/**
+ * The definitions for just the verdicts in this reply.
+ *
+ * Sending all ~35 on every call costs input tokens on a latency-sensitive
+ * path, and a typical reply carries one or two. Trimming also sharpens the
+ * instruction: the model reads only what applies.
+ */
+export function verdictGuideFor(verdicts: readonly string[]): string {
+  const wanted = [...new Set(verdicts)].filter((v) => v in MEANINGS);
+  return [
+    "## What each verdict means",
+    "",
+    ...wanted.map(
+      (v) =>
+        `- **${v}** (${SPEECH_ACTS[v as keyof typeof SPEECH_ACTS]}): ${MEANINGS[v as keyof typeof MEANINGS]}`,
+    ),
+  ].join("\n");
+}

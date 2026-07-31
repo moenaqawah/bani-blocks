@@ -37,6 +37,18 @@ export interface HumanizeArgs {
   /** What each verdict means, rendered from the client's catalog. */
   verdictGuide: string;
   /**
+   * What the customer actually said — supplied ONLY when the turn carries no
+   * facts and nothing happened, i.e. pure conversation.
+   *
+   * A `chitchat` payload says "nothing to act on" and nothing more, so the
+   * renderer had to guess whether it was a hello, a thank-you or a goodbye —
+   * and answered a hello as a goodbye (reported 2026-08-01). The fix is not a
+   * taxonomy of small talk; it is letting the model see the message and reply
+   * like a person. Withheld on every other turn, where the decision is the
+   * orchestrator's and the words would only tempt it to re-answer.
+   */
+  customerSaid?: string;
+  /**
    * The customer's name as WhatsApp reports it, if any.
    *
    * Passed for GRAMMATICAL AGREEMENT, not as a fact to state: Arabic inflects
@@ -131,6 +143,22 @@ function addressing(name: string | null): string {
   ].join(" ");
 }
 
+/**
+ * Small talk stays within the job. The receptionist can be human about a
+ * hello or a goodbye, but she is not a general assistant: anything that needs
+ * a decision belongs to the orchestrator, and it will arrive as its own turn.
+ */
+function conversational(said: string): string {
+  return [
+    `The customer said: "${said}"`,
+    "Reply to that, naturally, the way a friendly receptionist would — match a hello with a",
+    "hello, a goodbye with a goodbye, a thank-you with a you're-welcome.",
+    "Stay inside your job: do not answer questions about the salon, prices, products or policy;",
+    "do not mention, offer, confirm or change any appointment or time.",
+    "If they want something done, they will say so and the system will handle it — not you.",
+  ].join(" ");
+}
+
 export async function humanize(args: HumanizeArgs): Promise<HumanizeResult> {
   const fallback: HumanizeResult = { text: args.fallbackText, fellBack: true };
   if (args.blocks.length === 0) return { text: args.fallbackText, fellBack: false };
@@ -148,6 +176,7 @@ export async function humanize(args: HumanizeArgs): Promise<HumanizeResult> {
         LANGUAGE[args.locale],
         args.continuing ? CONTINUING : OPENING,
         addressing(args.customerName),
+        ...(args.customerSaid ? [conversational(args.customerSaid)] : []),
       ].join("\n\n"),
       prompt: JSON.stringify(args.blocks, null, 2),
       temperature: 0.4,

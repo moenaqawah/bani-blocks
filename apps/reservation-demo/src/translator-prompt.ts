@@ -153,7 +153,8 @@ ${roster}
   are DECLINED by the system, not answered, so never try to answer them
   yourself. Never about whether a specific slot is free, and never about what
   the customer has booked.
-- chitchat — greetings, thanks, small talk.
+- chitchat — conversation with nothing to do: hello, thanks, goodbye, a remark.
+  Goodbyes and repeat hellos are all chitchat; do not try to sub-classify them.
 - unclear — anything else, and anything you are unsure about.
 
 ## Rules

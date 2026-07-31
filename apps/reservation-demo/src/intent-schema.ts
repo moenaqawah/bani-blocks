@@ -179,7 +179,10 @@ const question = z
 
 const chitchat = z
   .object({ kind: z.literal("chitchat") })
-  .describe("Greetings, thanks, small talk — nothing to do.");
+  .describe(
+    "Conversation with nothing to book or change — hello, thanks, goodbye, a passing remark. " +
+      "One kind covers all of them; the system replies to their actual words.",
+  );
 
 const unclear = z
   .object({ kind: z.literal("unclear") })

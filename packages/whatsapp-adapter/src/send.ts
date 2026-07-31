@@ -107,3 +107,43 @@ export async function sendText(
 
   return results;
 }
+
+/**
+ * Mark the inbound message read and show "typing…" in the customer's chat.
+ *
+ * A turn takes a few seconds — two model calls plus a Google Calendar read —
+ * and silence in a WhatsApp thread reads as "it's broken". WhatsApp clears the
+ * indicator as soon as the reply lands, or after 25 seconds, so it can only
+ * ever be shown while work is genuinely in flight.
+ *
+ * Best-effort by design: never let a cosmetic call fail a real reply.
+ */
+export async function showTyping(params: {
+  waMessageId: string;
+  phoneNumberId: string;
+  accessToken: string;
+  graphVersion: string;
+  fetchImpl?: typeof fetch;
+}): Promise<void> {
+  const f = params.fetchImpl ?? fetch;
+  try {
+    await f(
+      `https://graph.facebook.com/${params.graphVersion}/${params.phoneNumberId}/messages`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${params.accessToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          messaging_product: "whatsapp",
+          status: "read",
+          message_id: params.waMessageId,
+          typing_indicator: { type: "text" },
+        }),
+      },
+    );
+  } catch (err) {
+    logger.debug("typing indicator failed", { msg: String(err) });
+  }
+}

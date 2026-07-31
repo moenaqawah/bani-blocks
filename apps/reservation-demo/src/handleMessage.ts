@@ -13,7 +13,7 @@ import {
   withConversationLock,
   type InboundRow,
 } from "@bani/db";
-import { sendText } from "@bani/whatsapp-adapter";
+import { sendText, showTyping } from "@bani/whatsapp-adapter";
 import { buildMemory, getModel } from "@bani/agent-core";
 import { AppError, hashPhone, logger } from "@bani/shared";
 import { runConversationTurn } from "./turn.js";
@@ -151,6 +151,15 @@ interface PipelineParams {
 async function runPipeline(params: PipelineParams): Promise<void> {
   const { sql, ctx, env, customerId, conversationId, locale, isNewConv } = params;
   const now = new Date();
+
+  // Not awaited: the customer should see "typing…" while the turn runs, but a
+  // cosmetic call must never delay — or fail — the reply itself.
+  void showTyping({
+    waMessageId: ctx.waMessageId,
+    phoneNumberId: env.WHATSAPP_PHONE_NUMBER_ID,
+    accessToken: env.WHATSAPP_ACCESS_TOKEN,
+    graphVersion: env.WHATSAPP_GRAPH_VERSION,
+  });
 
   const historyCutoff = new Date(now.getTime() - env.AGENT_HISTORY_MAX_AGE_HOURS * 60 * 60 * 1000);
   const history = buildMemory(
