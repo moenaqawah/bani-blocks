@@ -235,109 +235,6 @@ async function extractConfirmations(
   return formatConfirmation(bookings, customerLocale);
 }
 
-// ─── invented-ref guard ──────────────────────────────────────────────
-
-/**
- * Scan the reply for BK- patterns and verify every ref found appears in
- * this turn's tool outputs. An invented ref is logged at error.
- * Returns true if the reply is safe (all refs are genuine or there are none).
- */
-function verifyRefsInReply(
-  reply: string,
-  steps: Array<{ toolName: string; output: unknown }>,
-): boolean {
-  const refsInReply = reply.match(/BK-[A-Z0-9]{6}/gi) ?? [];
-  if (refsInReply.length === 0) return true;
-
-  // Collect every legitimate ref from this turn's tool outputs
-  const legitRefs = new Set<string>();
-  for (const step of steps) {
-    const output = step.output as Record<string, unknown> | undefined;
-    if (!output) continue;
-
-    const collectRef = (val: unknown) => {
-      if (typeof val === "string" && /^BK-[A-Z0-9]{6}$/i.test(val)) {
-        legitRefs.add(val.toUpperCase());
-      }
-    };
-
-    // create_bookings: results[{ref}]
-    if (Array.isArray((output as { results?: unknown[] }).results)) {
-      for (const r of (output as { results: Array<{ ref?: string }> }).results) {
-        if (r.ref) collectRef(r.ref);
-      }
-    }
-    // Various single-ref shapes
-    if ((output as { ref?: string }).ref) collectRef((output as { ref: string }).ref);
-    if ((output as { oldRef?: string }).oldRef) collectRef((output as { oldRef: string }).oldRef);
-    if ((output as { newRef?: string }).newRef) collectRef((output as { newRef: string }).newRef);
-    // get_my_bookings: bookings[{ref}]
-    if (Array.isArray((output as { bookings?: Array<{ ref: string }> }).bookings)) {
-      for (const b of (output as { bookings: Array<{ ref: string }> }).bookings) {
-        if (b.ref) collectRef(b.ref);
-      }
-    }
-  }
-
-  for (const ref of refsInReply) {
-    if (!legitRefs.has(ref.toUpperCase())) {
-      logger.error("INVENTED REF DETECTED in agent reply", {
-        fabricatedRef: ref,
-      });
-      return false;
-    }
-  }
-
-  return true;
-}
-
-// ─── integrity gate ──────────────────────────────────────────────────
-
-/**
- * Hard post-agent validation: if the model claims booking success but no
- * confirmations were actually written to the DB, replace the reply with
- * an honest error message. This is code-level enforcement — not a prompt
- * tweak — because LLMs sometimes ignore soft rules after tool errors.
- */
-function validateReplyIntegrity(
-  reply: string,
-  steps: Array<{ toolName: string; output: unknown; errorMessage?: string }>,
-  confirmationBlock: string,
-  locale: "ar" | "en",
-): string {
-  // If confirmation block has content, real bookings exist — reply is valid
-  if (confirmationBlock.length > 0) return reply;
-
-  // Find all create_bookings calls
-  const bookingCalls = steps.filter((s) => s.toolName === "create_bookings");
-  if (bookingCalls.length === 0) return reply; // No booking attempted
-
-  // Did ANY create_bookings call return at least one ok:true?
-  const anySuccess = bookingCalls.some((step) => {
-    const out = step.output as Record<string, unknown> | undefined;
-    const results = out?.results as Array<{ ok?: boolean }> | undefined;
-    return results?.some((r) => r.ok === true) ?? false;
-  });
-  if (anySuccess) return reply;
-
-  // All create_bookings calls failed entirely and confirmation is empty.
-  // Scan the reply for success-claim language.
-  const successPatterns = locale === "ar"
-    ? /تم (الحجز|حجز|حجزت|تأكيد)|حجزتك|حجزنا|موعدك (?:صار |تمام|أكدنا|محجوز)|بشوفك|أكدنا|ثبّت|حجزتلك/
-    : /\b(?:confirmed|booked|all set|see you|secured|locked in)\b/i;
-
-  if (successPatterns.test(reply)) {
-    logger.warn("Model claimed booking success but no rows confirmed — replacing reply", {
-      replyPreview: reply.slice(0, 100),
-    });
-    return locale === "ar"
-      ? "آسفين، صار في مشكلة تقنية وما قدرنا نأكد الحجز. ممكن تجرب مرة تانية؟"
-      : "Sorry, there was a technical issue and we couldn't confirm your booking. Could you try again?";
-  }
-
-  return reply;
-}
-
 // ─── agent pipeline ──────────────────────────────────────────────────
 
 interface PipelineParams {
@@ -412,22 +309,12 @@ async function runAgentPipeline(params: PipelineParams): Promise<void> {
     });
   }
 
-  // Invented-ref guard
-  if (!verifyRefsInReply(result.text, result.steps)) {
-    logger.warn("Agent reply contained invented ref — will trigger integrity gate", {
-      waPhoneHash: phoneHash,
-    });
-  }
-
-  // Build confirmation block using bookingGroupId from tool output
-  let confirmationBlock = "";
+  // Build confirmation block using bookingGroupId from create_bookings output.
+  // The model MUST NOT write confirmation text — the system appends this block.
   const bookingGroupId = extractBookingGroupId(result.steps);
-  if (bookingGroupId) {
-    confirmationBlock = await extractConfirmations(sql, bookingGroupId, locale);
-  }
-
-  // Integrity gate: if model claims success but nothing was confirmed, veto
-  result.text = validateReplyIntegrity(result.text, result.steps, confirmationBlock, locale);
+  const confirmationBlock = bookingGroupId
+    ? await extractConfirmations(sql, bookingGroupId, locale)
+    : "";
 
   // Send reply
   const reply = withConsentPrefix(result.text + confirmationBlock, isNewConv);
